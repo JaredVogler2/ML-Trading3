@@ -43,7 +43,6 @@ class EnhancedFeatureEngineer:
         else:
             logger.info("Using CPU for feature engineering")
 
-
     def _calculate_warm_up_period(self) -> int:
         """Calculate required warm-up period for all features"""
 
@@ -63,10 +62,12 @@ class EnhancedFeatureEngineer:
 
         # Add 20% buffer for safety
         return int(max_warm_up * 1.2)
+
     @staticmethod
     @cuda.jit
     def _gpu_rolling_stats(arr, window, out_mean, out_std, out_skew, out_kurt):
         """GPU kernel for rolling statistics"""
+        # ... rest of the method
         idx = cuda.grid(1)
         n = arr.shape[0]
 
@@ -310,7 +311,7 @@ class EnhancedFeatureEngineer:
 
     def _create_price_features(self, df: pd.DataFrame) -> Dict:
         """Create price-based features with error handling"""
-        features = {}
+        features = {}  # MUST be before try block
 
         try:
             # Ensure float64 for TA-Lib
@@ -325,49 +326,56 @@ class EnhancedFeatureEngineer:
                     features[f'return_{period}d'] = df['close'].pct_change(period)
                     features[f'log_return_{period}d'] = np.log(df['close'] / df['close'].shift(period))
 
-            # Moving averages (adaptive to data length)
+            # Moving averages
             for period in [5, 10, 20, 50, 100, 200]:
                 if len(df) >= period * 2:  # Need 2x period for stability
                     try:
                         sma = talib.SMA(close, timeperiod=period)
-                        features[f'sma_{period}'] = sma
-                        features[f'price_to_sma_{period}'] = close / sma
+                        features[f'sma_{period}'] = pd.Series(sma, index=df.index)
+                        features[f'price_to_sma_{period}'] = pd.Series(close / sma, index=df.index)
 
                         # MA slopes
-                        features[f'sma_{period}_slope'] = (sma - talib.SMA(sma.astype('float64'), 5)) / 5
+                        sma_slope = talib.SMA(sma.astype('float64'), 5)
+                        features[f'sma_{period}_slope'] = pd.Series((sma - sma_slope) / 5, index=df.index)
                     except Exception as e:
                         logger.debug(f"Error calculating SMA {period}: {e}")
                         # Fallback to pandas
-                        features[f'sma_{period}'] = df['close'].rolling(period, min_periods=period // 2).mean()
-                        features[f'price_to_sma_{period}'] = df['close'] / features[f'sma_{period}']
+                        sma_series = df['close'].rolling(period, min_periods=period // 2).mean()
+                        features[f'sma_{period}'] = sma_series
+                        features[f'price_to_sma_{period}'] = df['close'] / sma_series
+                        features[f'sma_{period}_slope'] = sma_series.diff(5) / 5
 
             # Exponential moving averages
             for period in [8, 12, 21, 26, 50]:
                 if len(df) >= period * 2:
                     try:
                         ema = talib.EMA(close, timeperiod=period)
-                        features[f'ema_{period}'] = ema
-                        features[f'price_to_ema_{period}'] = close / ema
+                        features[f'ema_{period}'] = pd.Series(ema, index=df.index)
+                        features[f'price_to_ema_{period}'] = pd.Series(close / ema, index=df.index)
                     except Exception as e:
                         logger.debug(f"Error calculating EMA {period}: {e}")
-                        features[f'ema_{period}'] = df['close'].ewm(span=period, min_periods=period // 2).mean()
-                        features[f'price_to_ema_{period}'] = df['close'] / features[f'ema_{period}']
+                        ema_series = df['close'].ewm(span=period, min_periods=period // 2).mean()
+                        features[f'ema_{period}'] = ema_series
+                        features[f'price_to_ema_{period}'] = df['close'] / ema_series
 
             # VWAP approximation
             typical_price = (high + low + close) / 3
-            features['vwap'] = (typical_price * df['volume'].astype('float64')).rolling(20, min_periods=5).sum() / \
-                               df['volume'].astype('float64').rolling(20, min_periods=5).sum()
-            features['price_to_vwap'] = close / features['vwap']
+            vwap_numerator = pd.Series(typical_price * df['volume'].astype('float64').values, index=df.index).rolling(
+                20, min_periods=5).sum()
+            vwap_denominator = df['volume'].astype('float64').rolling(20, min_periods=5).sum()
+            features['vwap'] = vwap_numerator / vwap_denominator
+            features['price_to_vwap'] = df['close'] / features['vwap']
 
             # Price positions and ranges
-            features['close_to_high'] = close / high
-            features['close_to_low'] = close / low
-            features['high_low_range'] = (high - low) / close
-            features['close_to_open'] = close / open_price
-            features['body_size'] = abs(close - open_price) / close
+            features['close_to_high'] = pd.Series(close / high, index=df.index)
+            features['close_to_low'] = pd.Series(close / low, index=df.index)
+            features['high_low_range'] = pd.Series((high - low) / close, index=df.index)
+            features['close_to_open'] = pd.Series(close / open_price, index=df.index)
+            features['body_size'] = pd.Series(abs(close - open_price) / close, index=df.index)
 
             # Gaps
-            features['gap'] = open_price / df['close'].shift(1).values
+            prev_close = df['close'].shift(1).values
+            features['gap'] = pd.Series(open_price / prev_close, index=df.index)
             features['gap_size'] = abs(features['gap'] - 1)
             features['gap_up'] = (features['gap'] > 1.01).astype(int)
             features['gap_down'] = (features['gap'] < 0.99).astype(int)
@@ -380,16 +388,16 @@ class EnhancedFeatureEngineer:
 
                     features[f'resistance_{period}d'] = resistance
                     features[f'support_{period}d'] = support
-                    features[f'dist_from_resistance_{period}d'] = (resistance - close) / close
-                    features[f'dist_from_support_{period}d'] = (close - support) / close
-                    features[f'sr_range_{period}d'] = (resistance - support) / close
+                    features[f'dist_from_resistance_{period}d'] = (resistance - df['close']) / df['close']
+                    features[f'dist_from_support_{period}d'] = (df['close'] - support) / df['close']
+                    features[f'sr_range_{period}d'] = (resistance - support) / df['close']
 
             # Price channels
             for period in [20, 50]:
                 if len(df) >= period * 2:
                     highest = df['high'].rolling(period, min_periods=period // 2).max()
                     lowest = df['low'].rolling(period, min_periods=period // 2).min()
-                    features[f'price_channel_pos_{period}'] = (close - lowest) / (highest - lowest + 1e-10)
+                    features[f'price_channel_pos_{period}'] = (df['close'] - lowest) / (highest - lowest + 1e-10)
 
             # Fibonacci retracements (only if enough data)
             if len(df) >= 100:
@@ -400,13 +408,13 @@ class EnhancedFeatureEngineer:
                 fib_levels = [0.236, 0.382, 0.5, 0.618, 0.786]
                 for level in fib_levels:
                     fib_price = low_100 + fib_range * level
-                    features[f'dist_from_fib_{int(level * 1000)}'] = (close - fib_price) / close
+                    features[f'dist_from_fib_{int(level * 1000)}'] = (df['close'] - fib_price) / df['close']
 
         except Exception as e:
             logger.error(f"Error in price features: {e}")
-            # Return what we have
+            # Return what we have so far
 
-        return features
+        return features  # MUST be after except block
 
     def _create_volume_features(self, df: pd.DataFrame) -> Dict:
         """Create volume-based features with error handling"""
@@ -1807,27 +1815,27 @@ class EnhancedFeatureEngineer:
         if N < m + 1:
             return 0
 
-    def _maxdist(xi, xj, m):
+        def _maxdist(xi, xj, m):
             """Calculate maximum distance between patterns"""
             return max([abs(float(xi[k]) - float(xj[k])) for k in range(m)])
 
-    def _phi(m):
-        """Calculate phi(m)"""
-        templates = np.array([series[i:i + m] for i in range(N - m + 1)])
-        C = 0
-        for i in range(N - m + 1):
-        template_i = templates[i]
-        C += sum([1 for j in range(N - m + 1) if i != j and
-        _maxdist(template_i, templates[j], m) <= r])
-        return C / (N - m + 1) / (N - m) if (N - m + 1) * (N - m) > 0 else 0
+        def _phi(m):
+            """Calculate phi(m)"""
+            templates = np.array([series[i:i + m] for i in range(N - m + 1)])
+            C = 0
+            for i in range(N - m + 1):
+                template_i = templates[i]
+                C += sum([1 for j in range(N - m + 1) if i != j and
+                          _maxdist(template_i, templates[j], m) <= r])
+            return C / (N - m + 1) / (N - m) if (N - m + 1) * (N - m) > 0 else 0
 
         try:
             phi_m = _phi(m)
             phi_m1 = _phi(m + 1)
             if phi_m > 0 and phi_m1 > 0:
-            return -np.log(phi_m1 / phi_m)
+                return -np.log(phi_m1 / phi_m)
             else:
-            return 0
+                return 0
         except:
             return 0
 

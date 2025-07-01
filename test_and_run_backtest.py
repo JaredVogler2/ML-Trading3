@@ -105,41 +105,41 @@ def quick_data_test():
 
 def run_minimal_backtest():
     """Run a minimal backtest to test the system"""
-    print("\nRunning minimal backtest...")
+    print("\nRunning minimal backtest with professional standards...")
 
     from hedge_fund_ml_backtest import HedgeFundBacktester, HedgeFundBacktestConfig
     from config.watchlist import WATCHLIST
 
-    # Use minimal config for testing
+    # Professional configuration
     config = HedgeFundBacktestConfig(
         initial_capital=100000,
         max_positions=5,  # Small for testing
+
+        # Smaller windows for testing
+        train_months=3,  # 3 months training
+        validation_months=1,  # 1 month validation
+        test_months=1,  # 1 month test
+        buffer_days=5,  # 5 day buffer between periods
+
+        # Lower thresholds for testing
         min_training_samples=50,
         min_liquidity_usd=500_000,
-        # IMPORTANT: Reduced feature importance threshold for testing
-        feature_importance_threshold=0.01,  # Lower threshold
-        # IMPORTANT: Ensure sufficient training period
-        train_months=6,  # At least 6 months for 200+ days
-        validation_months=1,
-        test_months=1,
-        buffer_days=5
+        feature_importance_threshold=0.01,
+        min_validation_score=0.5,  # Lower for testing
+        min_prediction_confidence=0.55  # Lower for testing
     )
 
     # Create backtester
     backtester = HedgeFundBacktester(config)
 
-    # IMPORTANT: Use longer period to ensure enough data for features
-    # Need at least 200 trading days + test period
+    # Use 2 years of data to ensure we have enough for walk-forward
     end_date = datetime.now()
-    start_date = end_date - timedelta(days=500)  # Sufficient for all features
+    start_date = end_date - timedelta(days=365 * 2)  # 2 years
 
     print(f"Test period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
     print(f"Testing with first 10 symbols: {WATCHLIST[:10]}")
-
-    # IMPORTANT: Set data_lookback_days if needed
-    # This ensures we fetch enough historical data before the start date
-    if hasattr(backtester, 'data_manager') and hasattr(backtester.data_manager, 'data_lookback_days'):
-        backtester.data_manager.data_lookback_days = 250  # Extra buffer for feature calculation
+    print("\nNote: Using professional walk-forward optimization")
+    print("This ensures no future data leakage\n")
 
     results = backtester.run_backtest(
         symbols=WATCHLIST[:10],  # Test with 10 symbols
@@ -149,22 +149,43 @@ def run_minimal_backtest():
 
     if 'error' not in results:
         print(f"\n✓ Minimal backtest successful!")
-        print(f"  Total Return: {results['total_return'] * 100:.2f}%")
-        print(f"  Sharpe Ratio: {results['sharpe_ratio']:.2f}")
-        print(f"  Total Trades: {results['total_trades']}")
+        print(f"\nResults Summary:")
+        print(f"  Total Return: {results.get('total_return', 0) * 100:.2f}%")
+        print(f"  Annual Return: {results.get('annual_return', 0) * 100:.2f}%")
+        print(f"  Sharpe Ratio: {results.get('sharpe_ratio', 0):.2f}")
+        print(f"  Max Drawdown: {results.get('max_drawdown', 0) * 100:.2f}%")
+        print(f"  Total Trades: {results.get('total_trades', 0)}")
+        print(f"  Win Rate: {results.get('win_rate', 0) * 100:.1f}%")
 
-        # Add more diagnostic info
-        if 'symbol_stats' in results:
-            print(f"\nSymbol Statistics:")
-            for symbol, stats in results['symbol_stats'].items():
-                print(f"  {symbol}: {stats.get('trades', 0)} trades")
+        # Show data integrity
+        if 'detailed_report' in results:
+            report = results['detailed_report']
+            print(f"\nData Integrity Check:")
+            print(f"  {report['summary']['data_integrity']}")
+            print(f"  Windows processed: {report['summary']['total_windows']}")
+            print(f"  Average validation AUC: {report['summary']['avg_validation_auc']:.4f}")
+
+            # Show window details
+            print(f"\nWalk-Forward Windows:")
+            for window in report['window_analysis'][:3]:  # Show first 3
+                print(f"  Window {window['index'] + 1}:")
+                print(f"    Train: {window['train_period']}")
+                print(f"    Val: {window['val_period']}")
+                print(f"    Test: {window['test_period']}")
+                print(f"    Val AUC: {window['validation_auc']:.4f}")
 
         return True
     else:
         print(f"\n✗ Backtest failed: {results['error']}")
-        # Print more diagnostic information
-        if 'details' in results:
-            print(f"Details: {results['details']}")
+
+        # Show detailed report if available
+        if 'detailed_report' in results:
+            report = results['detailed_report']
+            print(f"\nData Integrity Checks:")
+            for check in report['data_integrity_checks'][:5]:  # Show first 5
+                status = "✓" if check['passed'] else "✗"
+                print(f"  {status} {check['check']}: {check['details']}")
+
         return False
 
 

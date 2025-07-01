@@ -1,8 +1,7 @@
 # models/ensemble_gpu_hedge_fund.py
 """
 Enhanced GPU-Accelerated Ensemble Model for Hedge Fund ML Trading
-Integrates with existing codebase and enhanced features
-No RAPIDS dependency
+Modified for maximum symbol utilization
 """
 
 import numpy as np
@@ -93,9 +92,9 @@ class AttentionLSTM(nn.Module):
             hidden_dim * 2, num_heads=n_heads, dropout=dropout, batch_first=True
         )
 
-        # Deeper output network
+        # Deeper output network - FIX: Input size should be hidden_dim * 4 due to concatenation
         self.output_net = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.Linear(hidden_dim * 4, hidden_dim),  # Changed from hidden_dim * 2 to hidden_dim * 4
             nn.ReLU(),
             nn.Dropout(dropout),
             nn.BatchNorm1d(hidden_dim),
@@ -122,7 +121,7 @@ class AttentionLSTM(nn.Module):
         # Global pooling (both mean and max)
         avg_pool = torch.mean(combined, dim=1)
         max_pool, _ = torch.max(combined, dim=1)
-        pooled = torch.cat([avg_pool, max_pool], dim=-1)
+        pooled = torch.cat([avg_pool, max_pool], dim=-1)  # This concatenates to hidden_dim * 4
 
         # Reshape for BatchNorm
         batch_size = pooled.shape[0]
@@ -244,7 +243,7 @@ class CNNLSTM(nn.Module):
 
 
 class HedgeFundGPUEnsemble:
-    """GPU-accelerated ensemble model for hedge fund trading"""
+    """GPU-accelerated ensemble model for hedge fund trading - ENHANCED FOR FULL WATCHLIST"""
 
     def __init__(self, config: GPUConfig = None):
         self.config = config or GPUConfig()
@@ -257,6 +256,7 @@ class HedgeFundGPUEnsemble:
 
         # Feature names storage
         self.feature_names = None
+        self.common_features = None  # Store common features across symbols
 
         # Initialize device
         if torch.cuda.is_available():
@@ -266,58 +266,150 @@ class HedgeFundGPUEnsemble:
         else:
             logger.warning("GPU not available, using CPU")
 
+    def _create_minimal_features(self, df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+        """Create minimal feature set when full features fail"""
+
+        features = pd.DataFrame(index=df.index)
+
+        # Essential price features
+        features['returns_1d'] = df['close'].pct_change()
+        features['returns_5d'] = df['close'].pct_change(5)
+        features['returns_20d'] = df['close'].pct_change(20)
+
+        # Simple moving averages
+        for period in [5, 10, 20, 50]:
+            if len(df) >= period:
+                features[f'sma_{period}'] = df['close'].rolling(period).mean()
+                features[f'price_to_sma_{period}'] = df['close'] / features[f'sma_{period}']
+
+        # Volume
+        features['volume_ratio'] = df['volume'] / df['volume'].rolling(20, min_periods=5).mean()
+
+        # Volatility
+        features['volatility_20d'] = features['returns_1d'].rolling(20, min_periods=5).std() * np.sqrt(252)
+
+        # Simple RSI
+        delta = df['close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14, min_periods=5).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14, min_periods=5).mean()
+        rs = gain / loss
+        features['rsi_14'] = 100 - (100 / (1 + rs))
+
+        # Fill NaN
+        features = features.fillna(method='ffill', limit=5).fillna(0)
+
+        return features
+
     def prepare_training_data(self, train_data: Dict[str, pd.DataFrame]) -> Tuple[pd.DataFrame, pd.Series, Dict]:
-        """Prepare training data with enhanced features for all symbols"""
+        """Prepare training data with enhanced features for all symbols - MORE INCLUSIVE"""
 
         logger.info("Preparing training data with enhanced features...")
 
         X_train_all = []
         y_train_all = []
         symbol_info = []
+        skipped_symbols = []
+
+        # First pass: identify common features
+        feature_availability = {}
 
         for symbol, df in train_data.items():
-            if len(df) < 200:  # Need enough data for features
-                logger.warning(f"Skipping {symbol}: insufficient data")
+            # REDUCED minimum from 200 to 100
+            if len(df) < 100:  # Was 200
+                logger.debug(f"Skipping {symbol}: only {len(df)} days (need 100+)")
+                skipped_symbols.append((symbol, f'insufficient_data_{len(df)}'))
                 continue
 
             try:
-                # Create enhanced features
+                # Try full features first
                 features = self.feature_engineer.create_all_features(df, symbol)
 
-                if features.empty or len(features) < 100:
-                    logger.warning(f"Skipping {symbol}: insufficient features")
-                    continue
+                # If full features fail, use minimal features
+                if features.empty or len(features) < 50:  # Reduced from 100
+                    logger.info(f"Using minimal features for {symbol}")
+                    features = self._create_minimal_features(df, symbol)
 
-                # Create target (5-day forward return > 2%)
+                # Track feature availability
+                for col in features.columns:
+                    if col not in feature_availability:
+                        feature_availability[col] = 0
+                    feature_availability[col] += 1
+
+            except Exception as e:
+                logger.error(f"Error analyzing features for {symbol}: {e}")
+                skipped_symbols.append((symbol, str(e)))
+                continue
+
+        # Select common features (available in at least 80% of symbols)
+        min_symbols = int(len(train_data) * 0.8)
+        self.common_features = [feat for feat, count in feature_availability.items()
+                                if count >= min_symbols]
+
+        logger.info(f"Selected {len(self.common_features)} common features from {len(feature_availability)} total")
+
+        # Second pass: prepare data with common features
+        for symbol, df in train_data.items():
+            if len(df) < 100:
+                continue
+
+            try:
+                # Generate features
+                features = self.feature_engineer.create_all_features(df, symbol)
+                if features.empty or len(features) < 50:
+                    features = self._create_minimal_features(df, symbol)
+
+                # Select only common features
+                available_common = [f for f in self.common_features if f in features.columns]
+                features_subset = features[available_common].copy()
+
+                # Add missing features as zeros
+                for feat in self.common_features:
+                    if feat not in features_subset.columns:
+                        features_subset[feat] = 0
+
+                # Create target with adaptive threshold
+                volatility = df['close'].pct_change().std()
+                if volatility > 0.03:
+                    threshold = 0.03  # 3% for volatile stocks
+                elif volatility < 0.01:
+                    threshold = 0.01  # 1% for stable stocks
+                else:
+                    threshold = 0.02  # 2% default
+
                 forward_return = df['close'].pct_change(self.config.prediction_horizon).shift(
                     -self.config.prediction_horizon)
-                target = (forward_return > 0.02).astype(int)
+                target = (forward_return > threshold).astype(int)
 
                 # Align features and target
-                min_len = min(len(features), len(target))
-                features = features.iloc[:min_len]
+                min_len = min(len(features_subset), len(target))
+                features_subset = features_subset.iloc[:min_len]
                 target = target.iloc[:min_len]
 
                 # Remove last prediction_horizon rows and any NaN
-                features = features[:-self.config.prediction_horizon]
+                features_subset = features_subset[:-self.config.prediction_horizon]
                 target = target[:-self.config.prediction_horizon]
 
                 # Remove NaN
-                valid_idx = ~(features.isna().any(axis=1) | target.isna())
-                features = features[valid_idx]
+                valid_idx = ~(features_subset.isna().any(axis=1) | target.isna())
+                features_subset = features_subset[valid_idx]
                 target = target[valid_idx]
 
-                if len(features) > 50:
-                    X_train_all.append(features)
+                if len(features_subset) > 50:
+                    X_train_all.append(features_subset)
                     y_train_all.append(target)
                     symbol_info.append({
                         'symbol': symbol,
-                        'n_samples': len(features),
-                        'positive_rate': target.mean()
+                        'n_samples': len(features_subset),
+                        'positive_rate': target.mean(),
+                        'volatility': volatility,
+                        'threshold': threshold
                     })
+                else:
+                    skipped_symbols.append((symbol, f'insufficient_samples_{len(features_subset)}'))
 
             except Exception as e:
                 logger.error(f"Error processing {symbol}: {e}")
+                skipped_symbols.append((symbol, str(e)))
                 continue
 
         if not X_train_all:
@@ -325,15 +417,29 @@ class HedgeFundGPUEnsemble:
 
         # Combine all data
         X_train = pd.concat(X_train_all, ignore_index=True)
-        y_train = pd.concat(y_train_all, ignore_index=True)
 
         # Store feature names
         self.feature_names = X_train.columns.tolist()
+        y_train = pd.concat(y_train_all, ignore_index=True)
+
+        # Store feature names
+        self.feature_names = self.common_features
 
         # Log statistics
-        logger.info(f"Combined training data: {len(X_train)} samples from {len(symbol_info)} symbols")
-        logger.info(f"Feature count: {len(self.feature_names)}")
-        logger.info(f"Positive class rate: {y_train.mean():.2%}")
+        logger.info(f"Training data prepared:")
+        logger.info(
+            f"  Symbols included: {len(symbol_info)}/{len(train_data)} ({len(symbol_info) / len(train_data) * 100:.1f}%)")
+        logger.info(f"  Symbols skipped: {len(skipped_symbols)}")
+        logger.info(f"  Total samples: {len(X_train):,}")
+        logger.info(f"  Feature count: {len(self.feature_names)}")
+        logger.info(f"  Positive class rate: {y_train.mean():.2%}")
+
+        if skipped_symbols:
+            skip_reasons = {}
+            for sym, reason in skipped_symbols[:10]:  # Show first 10
+                reason_type = reason.split('_')[0]
+                skip_reasons[reason_type] = skip_reasons.get(reason_type, 0) + 1
+            logger.info(f"  Skip reasons: {skip_reasons}")
 
         # Log feature categories
         feature_categories = {
@@ -357,6 +463,35 @@ class HedgeFundGPUEnsemble:
             'symbol_info': symbol_info
         }
 
+
+
+    def _align_features(self, X_train: pd.DataFrame, X_val: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Ensure training and validation data have the same features"""
+
+        # Get common features
+        common_features = list(set(X_train.columns) & set(X_val.columns))
+
+        # Sort for consistency
+        common_features.sort()
+
+        logger.info(f"Aligning features: {len(X_train.columns)} train, {len(X_val.columns)} val -> {len(common_features)} common")
+
+        # Log missing features for debugging
+        train_only = set(X_train.columns) - set(X_val.columns)
+        val_only = set(X_val.columns) - set(X_train.columns)
+
+        if train_only:
+            logger.debug(f"Features only in training: {list(train_only)[:5]}...")
+        if val_only:
+            logger.debug(f"Features only in validation: {list(val_only)[:5]}...")
+
+        # Select only common features
+        X_train_aligned = X_train[common_features]
+        X_val_aligned = X_val[common_features]
+
+        return X_train_aligned, X_val_aligned
+
+
     def _calculate_class_weights(self, y):
         """Calculate class weights for imbalanced dataset"""
         classes = np.unique(y)
@@ -370,14 +505,33 @@ class HedgeFundGPUEnsemble:
 
         logger.info(f"Training ensemble on {len(X_train)} samples with {X_train.shape[1]} features")
 
+        # IMPORTANT: Align features BEFORE scaling
+        X_train, X_val = self._align_features(X_train, X_val)
+
         # Scale features
         if 'robust' not in self.scalers:
             self.scalers['robust'] = RobustScaler()
-            X_train_scaled = self.scalers['robust'].fit_transform(X_train)
+            # Fit only on finite values
+            finite_mask = np.isfinite(X_train).all(axis=1)
+            if finite_mask.sum() > 0:
+                X_train_finite = X_train[finite_mask]
+                self.scalers['robust'].fit(X_train_finite)
+            else:
+                logger.error("No finite values in training data!")
+                self.scalers['robust'].fit(X_train)  # Fallback
+            X_train_scaled = self.scalers['robust'].transform(X_train)
         else:
             X_train_scaled = self.scalers['robust'].transform(X_train)
 
         X_val_scaled = self.scalers['robust'].transform(X_val)
+
+        # Replace any NaN/inf values that might have been introduced by scaling
+        X_train_scaled = np.nan_to_num(X_train_scaled, nan=0.0, posinf=5.0, neginf=-5.0).astype(np.float32)
+        X_val_scaled = np.nan_to_num(X_val_scaled, nan=0.0, posinf=5.0, neginf=-5.0).astype(np.float32)
+
+        # Clip extreme values
+        X_train_scaled = np.clip(X_train_scaled, -10, 10)
+        X_val_scaled = np.clip(X_val_scaled, -10, 10)
 
         # Convert to numpy arrays
         X_train_scaled = np.nan_to_num(X_train_scaled, 0).astype(np.float32)
@@ -409,9 +563,28 @@ class HedgeFundGPUEnsemble:
 
         logger.info("Training deep learning models on GPU...")
 
+        # DEBUG: Check for NaN in input data
+        logger.info(f"Checking input data quality:")
+        logger.info(f"  X_train NaN count: {np.isnan(X_train).sum()}")
+        logger.info(f"  y_train NaN count: {np.isnan(y_train).sum()}")
+        logger.info(f"  X_train infinite count: {np.isinf(X_train).sum()}")
+        logger.info(f"  X_train range: [{np.nanmin(X_train):.2f}, {np.nanmax(X_train):.2f}]")
+
+        # Replace any remaining NaN/inf values
+        X_train = np.nan_to_num(X_train, nan=0.0, posinf=1e6, neginf=-1e6)
+        X_val = np.nan_to_num(X_val, nan=0.0, posinf=1e6, neginf=-1e6)
+
         # Prepare sequences
         X_train_seq, y_train_seq, weights_train_seq = self._prepare_sequences(X_train, y_train, sample_weights)
         X_val_seq, y_val_seq, _ = self._prepare_sequences(X_val, y_val)
+
+        # DEBUG: Check sequence data
+        logger.info(f"Sequence data quality:")
+        logger.info(f"  X_train_seq shape: {X_train_seq.shape}")
+        logger.info(f"  X_train_seq NaN count: {np.isnan(X_train_seq).sum()}")
+        logger.info(f"  y_train_seq NaN count: {np.isnan(y_train_seq).sum()}")
+
+        # ... rest of the method
 
         if len(X_train_seq) < 100:
             logger.warning("Insufficient sequences for deep learning training")
@@ -500,6 +673,7 @@ class HedgeFundGPUEnsemble:
         # Training loop
         best_val_auc = 0
         patience_counter = 0
+        best_model_state = None
 
         for epoch in range(self.config.n_epochs):
             # Training phase
@@ -521,6 +695,11 @@ class HedgeFundGPUEnsemble:
                     outputs = model(batch_X)
                     loss = criterion(outputs, batch_y)
 
+                # Check for NaN in loss
+                if torch.isnan(loss):
+                    logger.warning(f"NaN loss detected in {model_name} at epoch {epoch}, batch {batch_idx}")
+                    continue
+
                 # Gradient accumulation
                 loss = loss / self.config.gradient_accumulation_steps
 
@@ -529,22 +708,30 @@ class HedgeFundGPUEnsemble:
                     scaler.scale(loss).backward()
                     if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
                         scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                        scaler.step(optimizer)
-                        scaler.update()
+                        # Gradient clipping
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        if not torch.isnan(grad_norm):
+                            scaler.step(optimizer)
+                            scaler.update()
                         optimizer.zero_grad()
                 else:
                     loss.backward()
                     if (batch_idx + 1) % self.config.gradient_accumulation_steps == 0:
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                        optimizer.step()
+                        # Gradient clipping
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        if not torch.isnan(grad_norm):
+                            optimizer.step()
                         optimizer.zero_grad()
 
                 scheduler.step()
 
-                train_loss += loss.item() * self.config.gradient_accumulation_steps
-                train_preds.extend(torch.sigmoid(outputs).detach().cpu().numpy())
-                train_targets.extend(batch_y.detach().cpu().numpy())
+                # Store predictions - handle NaN
+                with torch.no_grad():
+                    preds = torch.sigmoid(outputs).detach().cpu().numpy()
+                    if not np.any(np.isnan(preds)):
+                        train_loss += loss.item() * self.config.gradient_accumulation_steps
+                        train_preds.extend(preds)
+                        train_targets.extend(batch_y.detach().cpu().numpy())
 
                 # Memory management
                 if batch_idx % self.config.empty_cache_freq == 0:
@@ -561,30 +748,45 @@ class HedgeFundGPUEnsemble:
                     batch_y = batch_y.to(self.config.device)
 
                     outputs = model(batch_X)
-                    val_preds.extend(torch.sigmoid(outputs).cpu().numpy())
-                    val_targets.extend(batch_y.cpu().numpy())
+                    preds = torch.sigmoid(outputs).cpu().numpy()
 
-            # Calculate metrics
-            train_auc = roc_auc_score(train_targets, train_preds)
-            val_auc = roc_auc_score(val_targets, val_preds)
+                    # Skip batch if contains NaN
+                    if not np.any(np.isnan(preds)):
+                        val_preds.extend(preds)
+                        val_targets.extend(batch_y.cpu().numpy())
 
-            # Early stopping
-            if val_auc > best_val_auc:
-                best_val_auc = val_auc
-                patience_counter = 0
-                best_model_state = model.state_dict()
+            # Calculate metrics only if we have valid predictions
+            if len(train_preds) > 0 and len(val_preds) > 0:
+                try:
+                    train_auc = roc_auc_score(train_targets, train_preds)
+                    val_auc = roc_auc_score(val_targets, val_preds)
+
+                    # Early stopping
+                    if val_auc > best_val_auc:
+                        best_val_auc = val_auc
+                        patience_counter = 0
+                        best_model_state = model.state_dict()
+                    else:
+                        patience_counter += 1
+                        if patience_counter >= self.config.early_stopping_patience:
+                            logger.info(f"Early stopping {model_name} at epoch {epoch}")
+                            break
+
+                    if epoch % 10 == 0:
+                        logger.info(f"{model_name} Epoch {epoch}: Train AUC={train_auc:.4f}, Val AUC={val_auc:.4f}")
+
+                except ValueError as e:
+                    logger.warning(f"Error calculating metrics for {model_name} at epoch {epoch}: {e}")
+                    continue
             else:
-                patience_counter += 1
-                if patience_counter >= self.config.early_stopping_patience:
-                    logger.info(f"Early stopping {model_name} at epoch {epoch}")
-                    break
+                logger.warning(f"No valid predictions for {model_name} at epoch {epoch}")
 
-            if epoch % 10 == 0:
-                logger.info(f"{model_name} Epoch {epoch}: Train AUC={train_auc:.4f}, Val AUC={val_auc:.4f}")
-
-        # Load best model
-        model.load_state_dict(best_model_state)
-        logger.info(f"{model_name} training completed. Best Val AUC: {best_val_auc:.4f}")
+        # Load best model if available
+        if best_model_state is not None:
+            model.load_state_dict(best_model_state)
+            logger.info(f"{model_name} training completed. Best Val AUC: {best_val_auc:.4f}")
+        else:
+            logger.warning(f"{model_name} training failed to produce valid model")
 
         return model
 
@@ -907,7 +1109,8 @@ class HedgeFundGPUEnsemble:
             'model_weights': self.model_weights,
             'scalers': self.scalers,
             'feature_importance': self.feature_importance,
-            'feature_names': self.feature_names
+            'feature_names': self.feature_names,
+            'common_features': self.common_features
         }, os.path.join(path, 'ensemble_config.pkl'))
 
         # Save tree models
@@ -935,6 +1138,7 @@ class HedgeFundGPUEnsemble:
         self.scalers = config['scalers']
         self.feature_importance = config['feature_importance']
         self.feature_names = config.get('feature_names', [])
+        self.common_features = config.get('common_features', self.feature_names)
 
         # Load tree models
         if os.path.exists(os.path.join(path, 'xgboost_model.json')):
