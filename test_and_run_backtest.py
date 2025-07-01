@@ -1,6 +1,7 @@
 # test_and_run_backtest.py
 """
 Complete script to test setup and run full watchlist training and backtest
+FIXED: Increased data period to ensure sufficient historical data for feature engineering
 """
 
 import os
@@ -89,8 +90,9 @@ def quick_data_test():
 
     for symbol in test_symbols:
         try:
+            # IMPORTANT: Fetch at least 1 year of data for feature engineering
             df = yf.download(symbol,
-                             start=(datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d'),
+                             start=(datetime.now() - timedelta(days=600)).strftime('%Y-%m-%d'),  # Extra data for 200-day features
                              end=datetime.now().strftime('%Y-%m-%d'),
                              progress=False)
             if not df.empty:
@@ -113,18 +115,31 @@ def run_minimal_backtest():
         initial_capital=100000,
         max_positions=5,  # Small for testing
         min_training_samples=50,
-        min_liquidity_usd=500_000
+        min_liquidity_usd=500_000,
+        # IMPORTANT: Reduced feature importance threshold for testing
+        feature_importance_threshold=0.01,  # Lower threshold
+        # IMPORTANT: Ensure sufficient training period
+        train_months=6,  # At least 6 months for 200+ days
+        validation_months=1,
+        test_months=1,
+        buffer_days=5
     )
 
     # Create backtester
     backtester = HedgeFundBacktester(config)
 
-    # Run on subset of symbols for 3 months
+    # IMPORTANT: Use longer period to ensure enough data for features
+    # Need at least 200 trading days + test period
     end_date = datetime.now()
-    start_date = end_date - timedelta(days=90)  # 3 months
+    start_date = end_date - timedelta(days=500)  # Sufficient for all features
 
     print(f"Test period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
     print(f"Testing with first 10 symbols: {WATCHLIST[:10]}")
+
+    # IMPORTANT: Set data_lookback_days if needed
+    # This ensures we fetch enough historical data before the start date
+    if hasattr(backtester, 'data_manager') and hasattr(backtester.data_manager, 'data_lookback_days'):
+        backtester.data_manager.data_lookback_days = 250  # Extra buffer for feature calculation
 
     results = backtester.run_backtest(
         symbols=WATCHLIST[:10],  # Test with 10 symbols
@@ -137,9 +152,19 @@ def run_minimal_backtest():
         print(f"  Total Return: {results['total_return'] * 100:.2f}%")
         print(f"  Sharpe Ratio: {results['sharpe_ratio']:.2f}")
         print(f"  Total Trades: {results['total_trades']}")
+
+        # Add more diagnostic info
+        if 'symbol_stats' in results:
+            print(f"\nSymbol Statistics:")
+            for symbol, stats in results['symbol_stats'].items():
+                print(f"  {symbol}: {stats.get('trades', 0)} trades")
+
         return True
     else:
         print(f"\n✗ Backtest failed: {results['error']}")
+        # Print more diagnostic information
+        if 'details' in results:
+            print(f"Details: {results['details']}")
         return False
 
 
@@ -149,13 +174,82 @@ def run_full_watchlist_backtest():
     print("RUNNING FULL WATCHLIST BACKTEST")
     print("=" * 60)
 
-    from run_hedge_fund_backtest import run_full_backtest
+    from hedge_fund_ml_backtest import HedgeFundBacktester, HedgeFundBacktestConfig
+    from config.watchlist import WATCHLIST
 
-    # This will run the complete backtest with all validations
-    results = run_full_backtest()
+    # Full configuration with proper settings
+    config = HedgeFundBacktestConfig(
+        # Capital settings
+        initial_capital=100000,
+        position_size_method="risk_parity",
+        base_position_size=0.02,  # 2% per position
+        max_position_size=0.05,  # 5% max
+        max_positions=20,  # Reasonable for 200+ symbols
+        max_sector_exposure=0.30,  # 30% sector limit
 
-    if results:
+        # Risk management
+        stop_loss_atr_multiplier=2.0,
+        take_profit_atr_multiplier=4.0,
+        max_portfolio_heat=0.06,  # 6% total portfolio risk
+        correlation_threshold=0.70,
+
+        # Walk-forward optimization
+        train_months=12,  # 1 year training (ensures 250+ days)
+        validation_months=3,  # 3 months validation
+        test_months=1,  # 1 month test
+        buffer_days=5,  # 5 day buffer
+        retrain_frequency_days=21,  # Monthly retraining
+
+        # ML thresholds
+        min_prediction_confidence=0.65,  # Reasonable confidence
+        ensemble_agreement_threshold=0.60,  # Reasonable agreement
+        feature_importance_threshold=0.02,  # Capture interaction features
+
+        # Execution realism
+        execution_delay_minutes=5,
+        use_vwap=True,
+        max_spread_bps=20,
+
+        # Performance filters
+        min_sharpe_for_trading=0.5,  # More reasonable threshold
+        min_training_samples=100,
+        min_validation_score=0.55,  # More reasonable
+
+        # Liquidity requirements
+        min_liquidity_usd=1_000_000  # $1M daily volume
+    )
+
+    # Create backtester
+    backtester = HedgeFundBacktester(config)
+
+    # Use full year for proper walk-forward
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=365 * 2)  # 2 years for walk-forward
+
+    print(f"Full backtest period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+    print(f"Testing with full watchlist: {len(WATCHLIST)} symbols")
+
+    # Ensure sufficient data lookback
+    if hasattr(backtester, 'data_manager') and hasattr(backtester.data_manager, 'data_lookback_days'):
+        backtester.data_manager.data_lookback_days = 300  # Extra buffer
+
+    results = backtester.run_backtest(
+        symbols=WATCHLIST,  # Full watchlist
+        start_date=start_date.strftime('%Y-%m-%d'),
+        end_date=end_date.strftime('%Y-%m-%d')
+    )
+
+    if 'error' not in results:
         print("\n✓ Full backtest completed successfully!")
+
+        # Show results
+        print(f"\nBacktest Results:")
+        print(f"  Total Return: {results['total_return'] * 100:.2f}%")
+        print(f"  Annual Return: {results.get('annual_return', 0) * 100:.2f}%")
+        print(f"  Sharpe Ratio: {results['sharpe_ratio']:.2f}")
+        print(f"  Max Drawdown: {results['max_drawdown'] * 100:.2f}%")
+        print(f"  Total Trades: {results['total_trades']}")
+        print(f"  Win Rate: {results.get('win_rate', 0) * 100:.1f}%")
 
         # Show utilization stats
         if 'symbol_utilization' in results:
@@ -163,10 +257,50 @@ def run_full_watchlist_backtest():
             print(f"\nWatchlist Utilization:")
             print(f"  Symbols traded: {util.get('symbols_traded', 0)} / {util.get('total_watchlist', 0)}")
             print(f"  Utilization rate: {util.get('utilization_rate', 0):.1f}%")
-    else:
-        print("\n✗ Full backtest failed!")
 
-    return results
+        return results
+    else:
+        print(f"\n✗ Full backtest failed: {results['error']}")
+        return None
+
+
+def verify_data_availability():
+    """Verify that we can fetch sufficient data for all symbols"""
+    print("\nVerifying data availability for feature engineering...")
+
+    import yfinance as yf
+    from config.watchlist import WATCHLIST
+
+    # Check a sample of symbols
+    sample_size = min(20, len(WATCHLIST))
+    sample_symbols = WATCHLIST[:sample_size]
+
+    issues = []
+    for symbol in sample_symbols:
+        try:
+            # Need at least 300 days for 200-day features + buffer
+            df = yf.download(
+                symbol,
+                start=(datetime.now() - timedelta(days=400)).strftime('%Y-%m-%d'),
+                end=datetime.now().strftime('%Y-%m-%d'),
+                progress=False
+            )
+
+            if len(df) < 250:
+                issues.append(f"{symbol}: Only {len(df)} days available")
+        except Exception as e:
+            issues.append(f"{symbol}: Error - {e}")
+
+    if issues:
+        print(f"⚠ Data issues found:")
+        for issue in issues[:5]:  # Show first 5 issues
+            print(f"  - {issue}")
+        if len(issues) > 5:
+            print(f"  ... and {len(issues) - 5} more")
+    else:
+        print(f"✓ All {sample_size} tested symbols have sufficient data")
+
+    return len(issues) == 0
 
 
 def main():
@@ -184,10 +318,15 @@ def main():
     # Step 2: Test data fetching
     quick_data_test()
 
-    # Step 3: Ask user what to run
+    # Step 3: Verify data availability
+    if not verify_data_availability():
+        print("\n⚠ Some symbols may not have sufficient historical data")
+        print("The backtest will skip these symbols automatically")
+
+    # Step 4: Ask user what to run
     print("\nOptions:")
-    print("1. Run minimal test (10 symbols, 3 months)")
-    print("2. Run full watchlist backtest (198 symbols, 1 year)")
+    print("1. Run minimal test (10 symbols, 1 year)")
+    print("2. Run full watchlist backtest (198 symbols, 2 years)")
     print("3. Run both (test first, then full)")
 
     choice = input("\nEnter choice (1-3): ").strip()
