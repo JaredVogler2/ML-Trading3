@@ -221,8 +221,8 @@ class CNNLSTM(nn.Module):
 
         # Multi-scale CNN feature extraction
         conv1_out = F.relu(self.batch_norm1(self.conv1(x)))
-        conv2_out = F.relu(self.batch_norm2(self.conv2(x)))
-        conv3_out = F.relu(self.batch_norm3(self.conv3(x)))
+        conv2_out = F.relu(self.batch_norm2(self.conv2(conv1_out)))
+        conv3_out = F.relu(self.batch_norm3(self.conv3(conv2_out)))
 
         # Use the highest resolution features for LSTM
         x = self.dropout1(conv3_out)
