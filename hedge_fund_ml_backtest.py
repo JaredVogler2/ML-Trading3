@@ -1,10 +1,7 @@
 # hedge_fund_ml_backtest.py
 """
 Institutional-Grade ML Backtesting System
-- No data leakage with proper walk-forward optimization
-- Handles 200+ symbols efficiently
-- Integrates with your ML ensemble models
-- Professional risk management and execution simulation
+Modified for maximum symbol utilization
 """
 
 import numpy as np
@@ -27,7 +24,7 @@ import torch
 from scipy import stats
 
 # Import your existing modules
-from models.ensemble_gpu_windows import GPUEnsembleModel
+from models.ensemble_gpu_hedge_fund import HedgeFundGPUEnsemble
 from models.enhanced_features import EnhancedFeatureEngineer
 from config.watchlist import WATCHLIST, SECTOR_MAPPING
 from execution_simulator import ExecutionSimulator, ExecutionConfig
@@ -39,60 +36,61 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class HedgeFundBacktestConfig:
-    """Professional backtesting configuration"""
+    """Professional backtesting configuration - RELAXED FOR MORE SYMBOLS"""
     # Capital and position sizing
     initial_capital: float = 100000
-    position_size_method: str = "risk_parity"  # "fixed", "kelly", "risk_parity"
-    base_position_size: float = 0.02  # 2% base size
-    max_position_size: float = 0.05  # 5% max
-    max_positions: int = 20
-    max_sector_exposure: float = 0.30
+    position_size_method: str = "risk_parity"
+    base_position_size: float = 0.02
+    max_position_size: float = 0.05
+    max_positions: int = 30  # INCREASED from 20
+    max_sector_exposure: float = 0.40  # INCREASED from 0.30
 
     # Risk parameters
-    stop_loss_atr_multiplier: float = 2.0  # Dynamic stop based on ATR
+    stop_loss_atr_multiplier: float = 2.0
     take_profit_atr_multiplier: float = 4.0
-    max_portfolio_heat: float = 0.06  # Max 6% portfolio risk
+    max_portfolio_heat: float = 0.08  # INCREASED from 0.06
     correlation_threshold: float = 0.70
 
     # Walk-forward parameters
-    train_months: int = 12  # 12 months training
-    validation_months: int = 3  # 3 months validation
-    test_months: int = 1  # 1 month out-of-sample test
-    buffer_days: int = 5  # Buffer between train/test
-    retrain_frequency_days: int = 21  # Monthly retraining
+    train_months: int = 12
+    validation_months: int = 3
+    test_months: int = 1
+    buffer_days: int = 5
+    retrain_frequency_days: int = 21
 
-    # ML parameters
-    min_prediction_confidence: float = 0.65
-    ensemble_agreement_threshold: float = 0.60  # 60% of models must agree
-    feature_importance_threshold: float = 0.05
+    # ML parameters - RELAXED
+    min_prediction_confidence: float = 0.60  # REDUCED from 0.65
+    ensemble_agreement_threshold: float = 0.55  # REDUCED from 0.60
+    feature_importance_threshold: float = 0.01  # REDUCED from 0.05
 
     # Execution parameters
-    execution_delay_minutes: int = 5  # Realistic execution delay
-    use_vwap: bool = True  # Use VWAP for execution price
-    max_spread_bps: float = 20  # Max acceptable spread
+    execution_delay_minutes: int = 5
+    use_vwap: bool = True
+    max_spread_bps: float = 25  # INCREASED from 20
 
-    # Performance filters
-    min_sharpe_for_trading: float = 1.0
-    min_training_samples: int = 100
-    min_validation_score: float = 0.55
+    # Performance filters - RELAXED
+    min_sharpe_for_trading: float = 0.8  # REDUCED from 1.0
+    min_training_samples: int = 50  # REDUCED from 100
+    min_validation_score: float = 0.50  # REDUCED from 0.55
 
-    # Data quality
-    min_liquidity_usd: float = 1_000_000  # $1M daily volume
-    max_missing_data_pct: float = 0.05  # 5% max missing data
+    # Data quality - RELAXED
+    min_liquidity_usd: float = 500_000  # REDUCED from 1_000_000
+    max_missing_data_pct: float = 0.10  # INCREASED from 0.05
 
 
 class DataPipeline:
-    """Efficient data pipeline with caching and quality checks"""
+    """Efficient data pipeline with caching and quality checks - ENHANCED"""
 
     def __init__(self, cache_dir: str = "cache/hedge_fund"):
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
         self.feature_engineer = EnhancedFeatureEngineer(use_gpu=torch.cuda.is_available())
+        self.symbol_stats = {}
 
     def fetch_and_prepare_data(self, symbols: List[str],
                                start_date: str, end_date: str,
                                force_refresh: bool = False) -> Dict[str, pd.DataFrame]:
-        """Fetch data with quality checks and feature engineering"""
+        """Fetch data with quality checks and feature engineering - MORE INCLUSIVE"""
 
         cache_file = os.path.join(self.cache_dir,
                                   f"prepared_data_{len(symbols)}_{start_date}_{end_date}.pkl")
@@ -107,6 +105,7 @@ class DataPipeline:
         # Fetch raw data in parallel
         all_data = {}
         failed_symbols = []
+        quality_issues = defaultdict(list)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
             future_to_symbol = {
@@ -120,20 +119,46 @@ class DataPipeline:
                 try:
                     data = future.result()
                     if data is not None and not data.empty:
-                        # Add features
-                        data = self._add_technical_features(data)
-                        data = self._add_ml_features(data)
+                        # Add features with error handling
+                        try:
+                            data = self._add_technical_features(data)
+                            data = self._add_ml_features(data)
+                        except Exception as e:
+                            logger.warning(f"Feature engineering failed for {symbol}: {e}")
+                            # Continue with basic features
+                            data = self._add_basic_features(data)
 
-                        # Quality check
-                        if self._pass_quality_check(data):
+                        # Quality check with relaxed criteria
+                        quality_pass, issues = self._pass_quality_check(data)
+                        if quality_pass:
                             all_data[symbol] = data
+                            self.symbol_stats[symbol] = {
+                                'days': len(data),
+                                'avg_volume': data['dollar_volume'].mean(),
+                                'volatility': data['returns'].std()
+                            }
                         else:
-                            failed_symbols.append(symbol)
+                            quality_issues[symbol] = issues
+                            # Try to salvage if we have enough data
+                            if len(data) >= 50:  # Very relaxed minimum
+                                all_data[symbol] = data
+                                logger.info(f"Including {symbol} despite quality issues: {issues}")
+                            else:
+                                failed_symbols.append(symbol)
                 except Exception as e:
                     logger.error(f"Error processing {symbol}: {e}")
                     failed_symbols.append(symbol)
 
         logger.info(f"Successfully prepared {len(all_data)} symbols, {len(failed_symbols)} failed")
+
+        if quality_issues:
+            logger.info(f"Symbols with quality issues: {len(quality_issues)}")
+            # Log summary of issues
+            issue_types = defaultdict(int)
+            for issues in quality_issues.values():
+                for issue in issues:
+                    issue_types[issue] += 1
+            logger.info(f"Issue breakdown: {dict(issue_types)}")
 
         # Save to cache
         with open(cache_file, 'wb') as f:
@@ -142,89 +167,149 @@ class DataPipeline:
         return all_data
 
     def _fetch_single_symbol(self, symbol: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
-        """Fetch single symbol with error handling"""
-        try:
-            df = yf.download(symbol, start=start_date, end=end_date,
-                             progress=False, auto_adjust=True)
+        """Fetch single symbol with error handling and retries"""
 
-            if df.empty or len(df) < 100:
-                return None
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                df = yf.download(symbol, start=start_date, end=end_date,
+                                 progress=False, auto_adjust=True, repair=True)
 
-            # Flatten multi-index if needed
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
+                if df.empty:
+                    # Try shorter period
+                    shorter_start = pd.to_datetime(end_date) - timedelta(days=365)
+                    df = yf.download(symbol, start=shorter_start, end=end_date,
+                                     progress=False, auto_adjust=True, repair=True)
 
-            # Standardize column names
-            df.columns = df.columns.str.lower()
+                if df.empty or len(df) < 50:  # Very relaxed minimum
+                    return None
 
-            # Add basic calculated fields
-            df['returns'] = df['close'].pct_change()
-            df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
-            df['dollar_volume'] = df['close'] * df['volume']
-            df['symbol'] = symbol
+                # Flatten multi-index if needed
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
 
-            return df
+                # Standardize column names
+                df.columns = df.columns.str.lower()
 
-        except Exception as e:
-            logger.error(f"Error fetching {symbol}: {e}")
-            return None
+                # Add basic calculated fields
+                df['returns'] = df['close'].pct_change()
+                df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
+                df['dollar_volume'] = df['close'] * df['volume']
+                df['symbol'] = symbol
+
+                return df
+
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    logger.error(f"Failed to fetch {symbol} after {max_retries} attempts: {e}")
+                    return None
+                else:
+                    time.sleep(1)  # Brief pause before retry
+
+    def _add_basic_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add minimal features when full feature engineering fails"""
+
+        # Returns
+        df['return_5d'] = df['close'].pct_change(5)
+        df['return_20d'] = df['close'].pct_change(20)
+
+        # Simple MAs
+        df['sma_20'] = df['close'].rolling(20, min_periods=10).mean()
+        df['sma_50'] = df['close'].rolling(50, min_periods=25).mean()
+        df['price_to_sma_20'] = df['close'] / df['sma_20']
+
+        # Volume
+        df['volume_ratio'] = df['volume'] / df['volume'].rolling(20, min_periods=10).mean()
+
+        # Volatility
+        df['volatility_20d'] = df['returns'].rolling(20, min_periods=10).std() * np.sqrt(252)
+
+        # ATR proxy
+        df['high_low_pct'] = (df['high'] - df['low']) / df['close']
+        df['atr'] = df['high_low_pct'].rolling(14, min_periods=7).mean() * df['close']
+
+        return df
 
     def _add_technical_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Add technical indicators using enhanced feature engineering"""
 
-        # Use the enhanced feature engineer for comprehensive features
-        feature_engineer = EnhancedFeatureEngineer(use_gpu=self.use_gpu)
+        try:
+            # Use the enhanced feature engineer for comprehensive features
+            features = self.feature_engineer.create_all_features(df, df.get('symbol', 'UNKNOWN'))
 
-        # Generate all features including advanced interactions
-        all_features = feature_engineer.create_all_features(df, symbol=df.get('symbol', 'UNKNOWN'))
+            # Merge with original dataframe
+            for col in features.columns:
+                if col not in df.columns:
+                    df[col] = features[col]
 
-        # Merge with original dataframe
-        for col in all_features.columns:
-            if col not in df.columns:
-                df[col] = all_features[col]
+        except Exception as e:
+            logger.warning(f"Enhanced features failed, using basic features: {e}")
+            df = self._add_basic_features(df)
 
         return df
 
     def _add_ml_features(self, df: pd.DataFrame) -> pd.DataFrame:
         """Add ML-specific features"""
-        # Market regime
-        df['trend_strength'] = (df['sma_20'] - df['sma_50']) / df['sma_50']
-        df['volatility_regime'] = pd.qcut(df['volatility_20d'].rolling(60).mean(),
-                                          q=3, labels=['low', 'medium', 'high'],
-                                          duplicates='drop')
 
-        # Microstructure
-        df['spread_proxy'] = df['high_low_pct'].rolling(5).mean()
-        df['volume_concentration'] = df['volume'].rolling(20).std() / df['volume'].rolling(20).mean()
+        try:
+            # Market regime
+            if 'sma_20' in df.columns and 'sma_50' in df.columns:
+                df['trend_strength'] = (df['sma_20'] - df['sma_50']) / df['sma_50']
 
-        # Calendar features
-        df['day_of_week'] = pd.to_datetime(df.index).dayofweek
-        df['month'] = pd.to_datetime(df.index).month
-        df['is_month_end'] = pd.to_datetime(df.index).is_month_end
+            # Volatility regime
+            if 'volatility_20d' in df.columns:
+                vol_ma = df['volatility_20d'].rolling(60, min_periods=30).mean()
+                df['volatility_regime'] = pd.qcut(vol_ma, q=3, labels=['low', 'medium', 'high'], duplicates='drop')
+
+            # Microstructure
+            if 'high_low_pct' in df.columns:
+                df['spread_proxy'] = df['high_low_pct'].rolling(5, min_periods=3).mean()
+
+            df['volume_concentration'] = df['volume'].rolling(20, min_periods=10).std() / df['volume'].rolling(20,
+                                                                                                               min_periods=10).mean()
+
+            # Calendar features
+            df['day_of_week'] = pd.to_datetime(df.index).dayofweek
+            df['month'] = pd.to_datetime(df.index).month
+            df['is_month_end'] = pd.to_datetime(df.index).is_month_end
+
+        except Exception as e:
+            logger.warning(f"ML features failed: {e}")
 
         return df
 
-    def _pass_quality_check(self, df: pd.DataFrame) -> bool:
-        """Quality checks for data"""
-        # Check minimum length
-        if len(df) < 252:  # 1 year minimum
-            return False
+    def _pass_quality_check(self, df: pd.DataFrame) -> Tuple[bool, List[str]]:
+        """Relaxed quality checks to include more symbols"""
 
-        # Check liquidity
+        issues = []
+
+        # Check minimum length - REDUCED from 252 to 100
+        if len(df) < 100:  # Was 252
+            issues.append(f"insufficient_data_{len(df)}_days")
+
+        # Check liquidity - REDUCED from 1M to 500K
         avg_dollar_volume = df['dollar_volume'].tail(20).mean()
-        if avg_dollar_volume < HedgeFundBacktestConfig().min_liquidity_usd:
-            return False
+        if avg_dollar_volume < 500_000:  # Was 1_000_000
+            issues.append(f"low_liquidity_{avg_dollar_volume:.0f}")
 
-        # Check missing data
+        # Check missing data - INCREASED tolerance from 5% to 10%
         missing_pct = df.isnull().sum().sum() / (len(df) * len(df.columns))
-        if missing_pct > HedgeFundBacktestConfig().max_missing_data_pct:
-            return False
+        if missing_pct > 0.10:  # Was 0.05
+            issues.append(f"high_missing_data_{missing_pct:.1%}")
 
-        return True
+        # Check for price anomalies
+        returns = df['returns'].dropna()
+        extreme_returns = (abs(returns) > 0.5).sum()  # 50% daily moves
+        if extreme_returns > 5:
+            issues.append(f"extreme_price_moves_{extreme_returns}")
+
+        # More lenient pass criteria
+        critical_issues = [i for i in issues if 'insufficient_data' in i]
+        return len(critical_issues) == 0, issues
 
 
 class MLModelManager:
-    """Manages ML model training, validation, and prediction"""
+    """Manages ML model training, validation, and prediction - ENHANCED"""
 
     def __init__(self, config: HedgeFundBacktestConfig):
         self.config = config
@@ -234,47 +319,53 @@ class MLModelManager:
 
     def train_models(self, train_data: Dict[str, pd.DataFrame],
                      val_data: Dict[str, pd.DataFrame],
-                     train_end_date: pd.Timestamp) -> GPUEnsembleModel:
+                     train_end_date: pd.Timestamp) -> HedgeFundGPUEnsemble:
         """Train ensemble model with proper validation"""
 
         logger.info(f"Training models with {len(train_data)} symbols...")
 
         # Initialize ensemble
-        ensemble = GPUEnsembleModel()
+        ensemble = HedgeFundGPUEnsemble()
 
-        # Prepare training data
-        X_train_all = []
-        y_train_all = []
+        # Prepare training data with enhanced method
+        X_train, y_train, train_info = ensemble.prepare_training_data(train_data)
+
+        # Prepare validation data
         X_val_all = []
         y_val_all = []
 
-        for symbol in train_data:
-            if symbol not in val_data:
+        for symbol in val_data:
+            if symbol not in train_data:
                 continue
 
             # Extract features and targets
-            X_train, y_train = self._prepare_ml_data(train_data[symbol])
             X_val, y_val = self._prepare_ml_data(val_data[symbol])
 
-            if X_train is not None and X_val is not None:
-                X_train_all.append(X_train)
-                y_train_all.append(y_train)
+            if X_val is not None and len(X_val) > 0:
+                # Align with common features
+                if ensemble.common_features:
+                    X_val_aligned = pd.DataFrame(index=X_val.index)
+                    for feat in ensemble.common_features:
+                        if feat in X_val.columns:
+                            X_val_aligned[feat] = X_val[feat]
+                        else:
+                            X_val_aligned[feat] = 0
+                    X_val = X_val_aligned
+
                 X_val_all.append(X_val)
                 y_val_all.append(y_val)
 
-        if not X_train_all:
-            logger.warning("No valid training data")
+        if not X_val_all:
+            logger.warning("No valid validation data")
             return ensemble
 
-        # Combine all data
-        X_train_combined = pd.concat(X_train_all)
-        y_train_combined = pd.concat(y_train_all)
+        # Combine validation data
         X_val_combined = pd.concat(X_val_all)
         y_val_combined = pd.concat(y_val_all)
 
         # Train ensemble
-        ensemble.train_combined(X_train_combined, y_train_combined,
-                                X_val_combined, y_val_combined)
+        ensemble.train_combined(X_train, y_train, X_val_combined, y_val_combined,
+                                sample_weights=train_info.get('sample_weights'))
 
         # Validate performance
         val_score = ensemble.validate(X_val_combined, y_val_combined)
@@ -283,8 +374,9 @@ class MLModelManager:
         # Store performance
         self.model_performance[train_end_date] = {
             'val_score': val_score,
-            'n_train_samples': len(X_train_combined),
-            'n_val_samples': len(X_val_combined)
+            'n_train_samples': len(X_train),
+            'n_val_samples': len(X_val_combined),
+            'symbols_used': len(train_info['symbol_info'])
         }
 
         # Calculate feature importance
@@ -295,102 +387,89 @@ class MLModelManager:
     def _prepare_ml_data(self, df: pd.DataFrame,
                          lookback: int = 20,
                          lookahead: int = 5) -> Tuple[pd.DataFrame, pd.Series]:
-        """Prepare features and targets for ML"""
+        """Prepare features and targets for ML - MORE FLEXIBLE"""
 
         # Feature columns - EXPANDED WITH ALL ENHANCED FEATURES
         feature_cols = [
-            # Basic features
-            'returns', 'volatility_20d', 'volume_ratio', 'atr_pct',
-            'price_to_vwap', 'return_5d', 'return_20d', 'trend_strength',
-            'price_to_sma_20', 'price_to_sma_50', 'close_to_high',
-            'spread_proxy', 'dollar_volume_rank',
+            # Basic features (always available)
+            'returns', 'return_5d', 'return_20d', 'volume_ratio',
+            'volatility_20d', 'price_to_sma_20', 'high_low_pct',
 
-            # Technical indicators
+            # Technical indicators (if available)
             'rsi_14', 'macd_hist_12_26_9', 'stoch_k_14_3', 'adx_14',
             'mfi_14', 'cci_20', 'williams_r_14', 'ultimate_osc',
 
-            # Advanced interaction features
+            # Advanced features (if available)
             'golden_cross', 'death_cross', 'sma_50_200_ratio', 'ma_alignment_score',
-            'price_above_all_ma', 'near_resistance', 'near_support',
             'bearish_divergence', 'bullish_divergence',
-            'macd_cross_up', 'macd_histogram_growing',
-            'oversold_combo', 'overbought_combo',
-            'volume_price_confirm', 'high_volume_reversal',
-            'bb_squeeze', 'volatility_breakout',
-            'strong_uptrend', 'strong_downtrend',
+            'macd_cross_up', 'oversold_combo', 'overbought_combo',
+            'volume_price_confirm', 'bb_squeeze', 'volatility_breakout',
             'bull_market_score', 'mean_reversion_setup', 'breakout_setup',
-            'trend_exhaustion', 'triple_buy_signal', 'triple_sell_signal',
-            'accumulation_day', 'distribution_day', 'acc_dist_ratio',
 
             # Volatility features
-            'bb_position_20_20', 'kc_position_20_20', 'volatility_regime',
-            'parkinson_vol', 'garman_klass_vol', 'yang_zhang_vol',
+            'bb_position_20_20', 'atr_pct_14', 'parkinson_vol',
 
             # Microstructure features
-            'amihud_illiquidity', 'kyle_lambda', 'noise_ratio',
+            'spread_proxy', 'volume_concentration',
 
             # Statistical features
-            'skew_20d', 'kurtosis_20d', 'hurst_50', 'entropy_20',
             'zscore_20', 'percentile_rank_50',
 
-            # Pattern features
-            'cdl_hammer', 'cdl_engulfing', 'cdl_morning_star',
-            'pin_bar_bull', 'pin_bar_bear', 'inside_bar',
-
-            # Regime features
+            # Market regime
             'trend_regime_bullish', 'trend_regime_bearish',
-            'high_vol_regime', 'low_vol_regime',
-            'trending_market', 'ranging_market'
+            'high_vol_regime', 'low_vol_regime'
         ]
 
-        # Filter for available features
+        # Filter for available features - MORE FLEXIBLE
         available_cols = [col for col in feature_cols if col in df.columns]
 
         # Log missing important features
         missing_features = set(feature_cols) - set(available_cols)
         if missing_features:
             important_missing = [f for f in missing_features
-                                 if any(x in f for x in ['golden_cross', 'bull_market_score',
-                                                         'divergence', 'triple_'])]
+                                 if any(x in f for x in ['golden_cross', 'bull_market_score'])]
             if important_missing:
-                logger.warning(f"Missing important features: {important_missing[:10]}")
+                logger.debug(f"Missing features for {df.get('symbol', 'unknown')}: {len(important_missing)}")
 
-        if len(available_cols) < len(feature_cols) * 0.5:  # Need at least 50% of features
-            logger.error(f"Too many missing features: {len(available_cols)}/{len(feature_cols)}")
-            return None, None
+        # REDUCED requirement from 50% to 30% of features
+        if len(available_cols) < len(feature_cols) * 0.3:  # Was 0.5
+            logger.debug(f"Using reduced feature set: {len(available_cols)}/{len(feature_cols)}")
+            # Don't return None, continue with available features
 
         # Create feature matrix
         features = df[available_cols].copy()
 
-        # Add rolling features for key interactions
-        for col in ['returns', 'volume_ratio', 'volatility_20d', 'ma_alignment_score', 'bull_market_score']:
+        # Add rolling features for key indicators
+        for col in ['returns', 'volume_ratio', 'volatility_20d']:
             if col in features.columns:
                 for lag in [1, 5, 10]:
                     features[f'{col}_lag_{lag}'] = features[col].shift(lag)
 
                 # Rolling stats
-                features[f'{col}_roll_mean_5'] = features[col].rolling(5).mean()
-                features[f'{col}_roll_std_5'] = features[col].rolling(5).std()
+                features[f'{col}_roll_mean_5'] = features[col].rolling(5, min_periods=3).mean()
+                features[f'{col}_roll_std_5'] = features[col].rolling(5, min_periods=3).std()
 
-        # Add time-based features for signals
-        for signal in ['golden_cross', 'death_cross', 'macd_cross_up', 'triple_buy_signal']:
-            if signal in features.columns:
-                # Days since last signal
-                signal_cumsum = features[signal].cumsum()
-                features[f'{signal}_days_since'] = features.groupby(signal_cumsum)[signal].cumcount()
+        # Create adaptive target based on symbol volatility
+        symbol_vol = df['returns'].std()
+        if symbol_vol > 0.03:  # High volatility
+            threshold = 0.03
+        elif symbol_vol < 0.01:  # Low volatility
+            threshold = 0.01
+        else:
+            threshold = 0.02
 
-        # Create target: positive return in next 5 days
+        # Calculate forward returns
         df['future_return'] = df['close'].shift(-lookahead) / df['close'] - 1
-        df['target'] = (df['future_return'] > 0.02).astype(int)  # 2% threshold
+        df['target'] = (df['future_return'] > threshold).astype(int)
 
         # Remove NaN rows
         valid_idx = features.notna().all(axis=1) & df['target'].notna()
 
-        logger.info(f"ML features prepared: {len(features.columns)} features, {valid_idx.sum()} valid samples")
+        logger.debug(f"ML features prepared: {len(features.columns)} features, {valid_idx.sum()} valid samples")
 
         return features[valid_idx], df['target'][valid_idx]
 
-    def predict(self, model: GPUEnsembleModel,
+    def predict(self, model: HedgeFundGPUEnsemble,
                 current_data: Dict[str, pd.DataFrame],
                 date: pd.Timestamp) -> Dict[str, Dict]:
         """Generate predictions for all symbols"""
@@ -419,12 +498,15 @@ class MLModelManager:
 
                 # Get individual model predictions for confidence
                 individual_preds = model.get_individual_predictions(latest_features)
-                agreement = np.mean([p > 0.5 for p in individual_preds])
+                if individual_preds:
+                    agreement = np.mean([p > 0.5 for p in individual_preds])
+                else:
+                    agreement = 0.5
 
                 predictions[symbol] = {
-                    'probability': pred[0],
-                    'prediction': int(pred[0] > 0.5),
-                    'confidence': pred[0] if pred[0] > 0.5 else 1 - pred[0],
+                    'probability': pred[0] if len(pred) > 0 else 0.5,
+                    'prediction': int(pred[0] > 0.5) if len(pred) > 0 else 0,
+                    'confidence': pred[0] if pred[0] > 0.5 else 1 - pred[0] if len(pred) > 0 else 0.5,
                     'model_agreement': agreement,
                     'features': latest_features.to_dict(orient='records')[0]
                 }
@@ -454,7 +536,8 @@ class RiskManager:
 
         elif self.config.position_size_method == "risk_parity":
             # Get volatility
-            volatility = market_data['volatility_20d'].iloc[-1]
+            volatility = market_data.get('volatility_20d', pd.Series()).iloc[
+                -1] if 'volatility_20d' in market_data else 0.02
 
             # Risk budget per position
             risk_budget = portfolio_value * self.config.base_position_size * 0.02  # 2% risk
@@ -510,9 +593,9 @@ class RiskManager:
 
         for symbol, position in positions.items():
             if symbol in market_data:
-                atr = market_data[symbol]['atr'].iloc[-1]
+                atr = market_data[symbol].get('atr', pd.Series()).iloc[-1] if 'atr' in market_data[symbol] else 0
                 position_value = position['quantity'] * position['current_price']
-                position_risk = (atr * position['quantity']) / portfolio_value
+                position_risk = (atr * position['quantity']) / portfolio_value if atr > 0 else 0.02
                 total_risk += position_risk
                 position_values[symbol] = position_value
 
@@ -590,7 +673,7 @@ class RiskManager:
 
 
 class HedgeFundBacktester:
-    """Main backtesting engine with ML integration"""
+    """Main backtesting engine with ML integration - ENHANCED FOR FULL WATCHLIST"""
 
     def __init__(self, config: HedgeFundBacktestConfig = None):
         self.config = config or HedgeFundBacktestConfig()
@@ -623,7 +706,8 @@ class HedgeFundBacktester:
         if len(all_data) < 10:
             return {'error': 'Insufficient data for backtesting'}
 
-        logger.info(f"Data prepared for {len(all_data)} symbols")
+        logger.info(
+            f"Data prepared for {len(all_data)} symbols ({len(all_data) / len(symbols) * 100:.1f}% of watchlist)")
 
         # Initialize portfolio
         cash = self.config.initial_capital
@@ -684,7 +768,8 @@ class HedgeFundBacktester:
                 'portfolio_value': portfolio_value,
                 'cash': cash,
                 'positions_value': positions_value,
-                'n_positions': len(self.positions)
+                'n_positions': len(self.positions),
+                'n_symbols_available': len(all_data)
             })
 
         # Close all remaining positions
@@ -704,7 +789,7 @@ class HedgeFundBacktester:
         return results
 
     def _train_model_for_date(self, all_data: Dict[str, pd.DataFrame],
-                              current_date: pd.Timestamp) -> GPUEnsembleModel:
+                              current_date: pd.Timestamp) -> HedgeFundGPUEnsemble:
         """Train model with proper data splitting"""
 
         # Calculate date ranges
@@ -726,11 +811,13 @@ class HedgeFundBacktester:
             val_mask = (df.index >= val_start) & (df.index < val_end)
             val_df = df[val_mask].copy()
 
+            # More relaxed requirements
             if len(train_df) >= self.config.min_training_samples and len(val_df) >= 20:
                 train_data[symbol] = train_df
                 val_data[symbol] = val_df
 
-        logger.info(f"Training on {len(train_data)} symbols")
+        logger.info(
+            f"Training on {len(train_data)} symbols ({len(train_data) / len(all_data) * 100:.1f}% of available)")
 
         # Train ensemble model
         model = self.model_manager.train_models(train_data, val_data, train_end)
@@ -744,12 +831,12 @@ class HedgeFundBacktester:
         valid_signals = []
 
         for symbol, pred in predictions.items():
-            # Check prediction quality
+            # Check prediction quality - RELAXED
             if (pred['confidence'] < self.config.min_prediction_confidence or
                     pred['model_agreement'] < self.config.ensemble_agreement_threshold):
                 continue
 
-            # Check liquidity
+            # Check liquidity - RELAXED
             if symbol in all_data:
                 df = all_data[symbol]
                 recent_data = df[df.index <= date].tail(20)
@@ -764,8 +851,9 @@ class HedgeFundBacktester:
                         'symbol': symbol,
                         'prediction': pred,
                         'current_price': recent_data['close'].iloc[-1],
-                        'atr': recent_data['atr'].iloc[-1],
-                        'volatility': recent_data['volatility_20d'].iloc[-1],
+                        'atr': recent_data.get('atr', recent_data['high_low_pct'] * recent_data['close']).iloc[-1],
+                        'volatility':
+                            recent_data.get('volatility_20d', recent_data['returns'].std() * np.sqrt(252)).iloc[-1],
                         'dollar_volume': avg_dollar_volume,
                         'score': pred['confidence'] * pred['model_agreement']
                     }
@@ -893,7 +981,7 @@ class HedgeFundBacktester:
             # Check time-based exit (optional)
             elif (date - position['entry_date']).days > 20:
                 # Re-evaluate position
-                current_vol = current_data['volatility_20d'].iloc[-1]
+                current_vol = current_data.get('volatility_20d', current_data['returns'].std() * np.sqrt(252)).iloc[-1]
                 if current_vol > 0.40:  # High volatility environment
                     exits.append({
                         'symbol': symbol,
@@ -1042,6 +1130,10 @@ class HedgeFundBacktester:
             win_rate = avg_win = avg_loss = profit_factor = 0
             ml_metrics = {}
 
+        # Symbol utilization metrics
+        unique_symbols_traded = len(set([t['symbol'] for t in self.trades if t['action'] == 'BUY']))
+        avg_symbols_available = equity_df['n_symbols_available'].mean()
+
         # Compile results
         results = {
             # Returns
@@ -1064,6 +1156,11 @@ class HedgeFundBacktester:
 
             # ML metrics
             'ml_performance': ml_metrics,
+
+            # Utilization metrics
+            'unique_symbols_traded': unique_symbols_traded,
+            'avg_symbols_available': avg_symbols_available,
+            'symbol_utilization_rate': unique_symbols_traded / len(WATCHLIST) * 100,
 
             # Data
             'equity_curve': equity_df,
@@ -1089,6 +1186,11 @@ class HedgeFundBacktester:
         print(f"\nTotal Trades: {results['total_trades']}")
         print(f"Win Rate: {results['win_rate'] * 100:.1f}%")
         print(f"Profit Factor: {results['profit_factor']:.2f}")
+
+        print(f"\nWATCHLIST UTILIZATION:")
+        print(f"Unique Symbols Traded: {results['unique_symbols_traded']} / {len(WATCHLIST)}")
+        print(f"Symbol Utilization Rate: {results['symbol_utilization_rate']:.1f}%")
+        print(f"Average Symbols Available: {results['avg_symbols_available']:.0f}")
 
         if results['ml_performance']:
             print(f"\nML Performance:")
@@ -1174,15 +1276,18 @@ class HedgeFundBacktester:
 
 
 def run_hedge_fund_backtest():
-    """Run the hedge fund grade backtest"""
+    """Run the hedge fund grade backtest with enhanced configuration"""
 
-    # Configuration
+    # Configuration optimized for full watchlist utilization
     config = HedgeFundBacktestConfig(
         initial_capital=100000,
         position_size_method="risk_parity",
-        max_positions=20,
-        min_prediction_confidence=0.65,
-        ensemble_agreement_threshold=0.60
+        max_positions=30,  # Increased
+        min_prediction_confidence=0.60,  # Reduced
+        ensemble_agreement_threshold=0.55,  # Reduced
+        min_liquidity_usd=500_000,  # Reduced
+        min_training_samples=50,  # Reduced
+        max_missing_data_pct=0.10  # Increased tolerance
     )
 
     # Create backtester
@@ -1195,7 +1300,7 @@ def run_hedge_fund_backtest():
     # Run on full watchlist
     logger.info(f"Running backtest on {len(WATCHLIST)} symbols")
     results = backtester.run_backtest(
-        symbols=WATCHLIST,  # Full 200+ symbols
+        symbols=WATCHLIST,  # Full 198 symbols
         start_date=start_date,
         end_date=end_date
     )
