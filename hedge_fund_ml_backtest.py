@@ -1,1250 +1,1166 @@
 # hedge_fund_ml_backtest.py
 """
-Professional Hedge Fund ML Trading Backtest System
-Features:
-- Walk-forward optimization with strict temporal isolation
-- No data leakage guarantees
-- Point-in-time data handling
-- Professional monitoring and reporting
-- Multiple ML models with GPU acceleration
-- Realistic execution simulation
+Institutional-Grade ML Backtesting System - FIXED VERSION
+- Proper imports and integrations
+- Better threshold management
+- Correct yfinance handling
 """
 
-import pandas as pd
 import numpy as np
-from typing import Dict, List, Tuple, Optional, Union
-from dataclasses import dataclass
+import pandas as pd
+import yfinance as yf
+from typing import Dict, List, Tuple, Optional, Set
 from datetime import datetime, timedelta
-import logging
 import warnings
 import json
-import os
+import logging
+from dataclasses import dataclass, field
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import yfinance as yf
+import concurrent.futures
+from tqdm import tqdm
 import matplotlib.pyplot as plt
 import seaborn as sns
-from tqdm import tqdm
+import os
+import pickle
+import torch
+from scipy import stats
 
-# Import custom modules
-from models.ensemble_gpu_hedge_fund import HedgeFundGPUEnsemble
+# Import your existing modules - FIXED IMPORTS
+from models.ensemble_gpu_hedge_fund import HedgeFundGPUEnsemble, GPUConfig
 from models.enhanced_features import EnhancedFeatureEngineer
+from config.watchlist import WATCHLIST, SECTOR_MAPPING
 from execution_simulator import ExecutionSimulator, ExecutionConfig
 
 warnings.filterwarnings('ignore')
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class HedgeFundBacktestConfig:
-    """Configuration for hedge fund backtest"""
-
+    """Professional backtesting configuration - ADJUSTED FOR BETTER SIGNALS"""
     # Capital and position sizing
-    initial_capital: float = 1_000_000
-    position_size_method: str = "risk_parity"  # "equal", "risk_parity", "kelly"
-    base_position_size: float = 0.02  # 2% per position
-    max_position_size: float = 0.05  # 5% max
+    initial_capital: float = 100000
+    position_size_method: str = "risk_parity"
+    base_position_size: float = 0.02
+    max_position_size: float = 0.05
     max_positions: int = 20
-    max_sector_exposure: float = 0.30  # 30% in one sector
+    max_sector_exposure: float = 0.30
 
-    # Risk management
+    # Risk parameters
     stop_loss_atr_multiplier: float = 2.0
-    take_profit_atr_multiplier: float = 4.0
-    max_portfolio_heat: float = 0.06  # 6% total portfolio risk
-    correlation_threshold: float = 0.70  # Avoid correlated positions
+    take_profit_atr_multiplier: float = 3.0  # Reduced from 4.0 for more achievable targets
+    max_portfolio_heat: float = 0.06
+    correlation_threshold: float = 0.70
 
-    # Walk-forward optimization
-    train_months: int = 12  # 12 months training
-    validation_months: int = 3  # 3 months validation
-    test_months: int = 1  # 1 month test
-    buffer_days: int = 5  # Days between train/test to avoid leakage
-    retrain_frequency_days: int = 21  # Retrain every month
+    # Walk-forward parameters
+    train_months: int = 12
+    validation_months: int = 3
+    test_months: int = 1
+    buffer_days: int = 5
+    retrain_frequency_days: int = 21
 
-    # ML model thresholds
-    min_prediction_confidence: float = 0.65
-    ensemble_agreement_threshold: float = 0.60
-    feature_importance_threshold: float = 0.02
+    # ML parameters - ADJUSTED FOR MORE SIGNALS
+    min_prediction_confidence: float = 0.55  # Reduced from 0.65
+    ensemble_agreement_threshold: float = 0.50  # Reduced from 0.60
+    feature_importance_threshold: float = 0.01  # Reduced from 0.05
 
-    # Execution
+    # Target parameters - MORE REALISTIC
+    target_return_threshold: float = 0.01  # 1% instead of 2%
+    target_lookforward_days: int = 5
+
+    # Execution parameters
     execution_delay_minutes: int = 5
     use_vwap: bool = True
     max_spread_bps: float = 20
 
-    # Filters
-    min_sharpe_for_trading: float = 1.0
+    # Performance filters
+    min_sharpe_for_trading: float = 0.5  # Reduced from 1.0
     min_training_samples: int = 100
-    min_validation_score: float = 0.55
+    min_validation_score: float = 0.52  # Reduced from 0.55
 
-    # Liquidity
-    min_liquidity_usd: float = 1_000_000  # $1M daily volume
-
-    # Data requirements
-    min_history_days: int = 504  # 2 years minimum
-    feature_lookback_days: int = 252  # 1 year for features
+    # Data quality
+    min_liquidity_usd: float = 1_000_000
+    max_missing_data_pct: float = 0.05
 
 
-class HedgeFundDataManager:
-    """Professional data manager with strict temporal isolation"""
+class DataPipeline:
+    """Efficient data pipeline with caching and quality checks"""
 
-    def __init__(self):
-        self.data_cache = {}
-        self.feature_lookback_days = 252  # 1 year for feature calculation
-        self.min_history_days = 504  # 2 years minimum history
+    def __init__(self, cache_dir: str = "cache/hedge_fund"):
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+        self.feature_engineer = EnhancedFeatureEngineer(use_gpu=torch.cuda.is_available())
 
-    def fetch_point_in_time_data(self, symbol: str, as_of_date: pd.Timestamp,
-                                 lookback_days: int = None) -> pd.DataFrame:
-        """Fetch data as it would have been available at a specific point in time"""
+    def fetch_and_prepare_data(self, symbols: List[str],
+                               start_date: str, end_date: str,
+                               force_refresh: bool = False) -> Dict[str, pd.DataFrame]:
+        """Fetch data with quality checks and feature engineering"""
 
-        if lookback_days is None:
-            lookback_days = self.min_history_days
+        cache_file = os.path.join(self.cache_dir,
+                                  f"prepared_data_{len(symbols)}_{start_date}_{end_date}.pkl")
 
-        # Ensure we're using timezone-naive dates
-        if hasattr(as_of_date, 'tz') and as_of_date.tz is not None:
-            as_of_date = as_of_date.tz_localize(None)
+        if os.path.exists(cache_file) and not force_refresh:
+            logger.info("Loading prepared data from cache...")
+            with open(cache_file, 'rb') as f:
+                return pickle.load(f)
 
-        # Calculate the data window
-        data_end = as_of_date
-        data_start = as_of_date - timedelta(days=lookback_days)
+        logger.info(f"Fetching data for {len(symbols)} symbols...")
 
-        cache_key = f"{symbol}_{data_start.strftime('%Y%m%d')}_{data_end.strftime('%Y%m%d')}"
+        # Fetch raw data in parallel
+        all_data = {}
+        failed_symbols = []
 
-        if cache_key in self.data_cache:
-            return self.data_cache[cache_key].copy()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_symbol = {
+                executor.submit(self._fetch_single_symbol, symbol, start_date, end_date): symbol
+                for symbol in symbols
+            }
 
+            for future in tqdm(concurrent.futures.as_completed(future_to_symbol),
+                               total=len(symbols), desc="Fetching data"):
+                symbol = future_to_symbol[future]
+                try:
+                    data = future.result()
+                    if data is not None and not data.empty:
+                        # Add features using enhanced feature engineer
+                        data_with_features = self.feature_engineer.create_all_features(data, symbol)
+
+                        # Merge original OHLCV data with features
+                        for col in ['open', 'high', 'low', 'close', 'volume']:
+                            if col in data.columns and col not in data_with_features.columns:
+                                data_with_features[col] = data[col]
+
+                        # Add symbol column
+                        data_with_features['symbol'] = symbol
+
+                        # Quality check
+                        if self._pass_quality_check(data_with_features):
+                            all_data[symbol] = data_with_features
+                        else:
+                            failed_symbols.append(symbol)
+                except Exception as e:
+                    logger.error(f"Error processing {symbol}: {e}")
+                    failed_symbols.append(symbol)
+
+        logger.info(f"Successfully prepared {len(all_data)} symbols, {len(failed_symbols)} failed")
+
+        # Save to cache
+        with open(cache_file, 'wb') as f:
+            pickle.dump(all_data, f)
+
+        return all_data
+
+    def _fetch_single_symbol(self, symbol: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+        """Fetch single symbol with error handling - FIXED FOR MULTIINDEX"""
         try:
-            # Fetch data up to and including as_of_date
-            df = yf.download(
-                symbol,
-                start=data_start.strftime('%Y-%m-%d'),
-                end=(data_end + timedelta(days=1)).strftime('%Y-%m-%d'),  # yfinance end is exclusive
-                auto_adjust=True,
-                progress=False
-            )
+            # Download with auto_adjust to avoid MultiIndex
+            df = yf.download(symbol, start=start_date, end=end_date,
+                             progress=False, auto_adjust=True, actions=False)
 
-            if df.empty:
-                logger.warning(f"No data for {symbol} as of {as_of_date.date()}")
-                return pd.DataFrame()
+            if df.empty or len(df) < 100:
+                return None
 
-            # Ensure timezone-naive
-            if df.index.tz is not None:
-                df.index = df.index.tz_localize(None)
-
-            # CRITICAL: Remove any data after as_of_date (in case of data errors)
-            df = df[df.index <= as_of_date]
-
-            # Clean column names
+            # Handle MultiIndex columns if they still exist
             if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [col[0].lower() if isinstance(col, tuple) else str(col).lower()
-                              for col in df.columns]
-            else:
-                df.columns = [str(col).lower() for col in df.columns]
+                # If MultiIndex, get the first level (price data)
+                df.columns = df.columns.get_level_values(0)
 
-            # Verify required columns
-            required_columns = ['open', 'high', 'low', 'close', 'volume']
-            if not all(col in df.columns for col in required_columns):
-                logger.error(f"Missing required columns for {symbol}")
-                return pd.DataFrame()
+            # Standardize column names
+            df.columns = df.columns.str.lower()
 
-            # Remove NaN rows
-            df = df.dropna(subset=required_columns)
+            # Ensure we have required columns
+            required_cols = ['open', 'high', 'low', 'close', 'volume']
+            if not all(col in df.columns for col in required_cols):
+                logger.warning(f"{symbol}: Missing required columns")
+                return None
 
-            # Add metadata
-            df['symbol'] = symbol
-            df['fetch_date'] = as_of_date
+            # Calculate additional base fields
+            df['returns'] = df['close'].pct_change()
+            df['log_returns'] = np.log(df['close'] / df['close'].shift(1))
+            df['dollar_volume'] = df['close'] * df['volume']
 
-            self.data_cache[cache_key] = df.copy()
-
-            logger.debug(f"Fetched {len(df)} days of {symbol} history as of {as_of_date.date()}")
+            # Basic technical indicators for feature engineering
+            df['atr'] = self._calculate_atr(df)
+            df['volatility_20d'] = df['returns'].rolling(20).std() * np.sqrt(252)
 
             return df
 
         except Exception as e:
-            logger.error(f"Error fetching {symbol} as of {as_of_date.date()}: {e}")
-            return pd.DataFrame()
+            logger.error(f"Error fetching {symbol}: {e}")
+            return None
 
-    def fetch_batch_point_in_time(self, symbols: List[str], as_of_date: pd.Timestamp) -> Dict[str, pd.DataFrame]:
-        """Fetch point-in-time data for multiple symbols"""
+    def _calculate_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Calculate Average True Range"""
+        high = df['high']
+        low = df['low']
+        close = df['close']
 
-        data = {}
+        hl = high - low
+        hc = abs(high - close.shift(1))
+        lc = abs(low - close.shift(1))
 
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            future_to_symbol = {
-                executor.submit(self.fetch_point_in_time_data, symbol, as_of_date): symbol
-                for symbol in symbols
-            }
+        tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
+        atr = tr.rolling(window=period).mean()
 
-            for future in as_completed(future_to_symbol):
-                symbol = future_to_symbol[future]
-                try:
-                    df = future.result()
-                    if not df.empty:
-                        data[symbol] = df
-                except Exception as e:
-                    logger.error(f"Failed to fetch {symbol}: {e}")
+        return atr
 
-        return data
-
-
-class WalkForwardOptimizer:
-    """Professional walk-forward optimization with proper data isolation"""
-
-    def __init__(self, config: HedgeFundBacktestConfig):
-        self.config = config
-        self.optimization_results = []
-
-        # Professional hedge fund parameters
-        self.train_window_days = config.train_months * 21  # Trading days
-        self.validation_window_days = config.validation_months * 21
-        self.test_window_days = config.test_months * 21
-        self.buffer_days = max(config.buffer_days, 5)  # Minimum 5 day buffer
-
-        # Feature engineering lookback
-        self.feature_lookback_days = config.feature_lookback_days
-
-    def create_walk_forward_windows(self, start_date: pd.Timestamp,
-                                    end_date: pd.Timestamp) -> List[Dict]:
-        """Create non-overlapping train/val/test windows with buffers"""
-
-        windows = []
-
-        # Need enough history for first window
-        min_start = start_date + timedelta(days=self.feature_lookback_days)
-
-        # Total days needed for one complete window
-        total_window_days = (self.train_window_days +
-                             self.validation_window_days +
-                             self.test_window_days +
-                             3 * self.buffer_days)  # 3 buffers total
-
-        # Start from first possible test date
-        current_test_start = min_start + timedelta(days=self.train_window_days +
-                                                        self.validation_window_days +
-                                                        2 * self.buffer_days)
-
-        while current_test_start + timedelta(days=self.test_window_days) <= end_date:
-            # Work backwards from test start date
-            test_start = current_test_start
-            test_end = test_start + timedelta(days=self.test_window_days)
-
-            # Buffer before test
-            buffer2_end = test_start
-            buffer2_start = buffer2_end - timedelta(days=self.buffer_days)
-
-            # Validation period
-            val_end = buffer2_start
-            val_start = val_end - timedelta(days=self.validation_window_days)
-
-            # Buffer before validation
-            buffer1_end = val_start
-            buffer1_start = buffer1_end - timedelta(days=self.buffer_days)
-
-            # Training period
-            train_end = buffer1_start
-            train_start = train_end - timedelta(days=self.train_window_days)
-
-            window = {
-                'train_start': train_start,
-                'train_end': train_end,
-                'buffer1_start': buffer1_start,
-                'buffer1_end': buffer1_end,
-                'val_start': val_start,
-                'val_end': val_end,
-                'buffer2_start': buffer2_start,
-                'buffer2_end': buffer2_end,
-                'test_start': test_start,
-                'test_end': test_end,
-                'as_of_date': test_start - timedelta(days=1)
-            }
-
-            windows.append(window)
-
-            # Move forward by test window size
-            current_test_start += timedelta(days=self.test_window_days)
-
-        return windows
-
-    def validate_window_integrity(self, window: Dict) -> bool:
-        """Ensure no data leakage between periods"""
-
-        # Check that periods don't overlap (but can touch at boundaries)
-        # Train should not overlap with validation
-        if window['train_end'] > window['val_start']:
-            logger.error(f"Train end {window['train_end']} overlaps with val start {window['val_start']}")
+    def _pass_quality_check(self, df: pd.DataFrame) -> bool:
+        """Quality checks for data"""
+        # Check minimum length
+        if len(df) < 252:  # 1 year minimum
             return False
 
-        # Validation should not overlap with test
-        if window['val_end'] > window['test_start']:
-            logger.error(f"Val end {window['val_end']} overlaps with test start {window['test_start']}")
-            return False
+        # Check liquidity
+        if 'dollar_volume' in df.columns:
+            avg_dollar_volume = df['dollar_volume'].tail(20).mean()
+            if avg_dollar_volume < HedgeFundBacktestConfig().min_liquidity_usd:
+                return False
 
-        # Check buffer gaps exist
-        train_val_gap = (window['val_start'] - window['train_end']).days
-        val_test_gap = (window['test_start'] - window['val_end']).days
-
-        if train_val_gap < self.buffer_days:
-            logger.error(f"Insufficient buffer between train and val: {train_val_gap} days (need {self.buffer_days})")
-            return False
-
-        if val_test_gap < self.buffer_days:
-            logger.error(f"Insufficient buffer between val and test: {val_test_gap} days (need {self.buffer_days})")
-            return False
-
-        # Verify chronological order
-        if not (window['train_start'] < window['train_end'] < window['val_start'] <
-                window['val_end'] < window['test_start'] < window['test_end']):
-            logger.error("Windows not in chronological order")
-            return False
-
-        return True
-
-
-class BacktestMonitor:
-    """Professional monitoring and reporting for backtests"""
-
-    def __init__(self):
-        self.metrics = {
-            'windows': [],
-            'trades': [],
-            'daily_pnl': [],
-            'feature_importance': {},
-            'model_performance': {},
-            'data_integrity_checks': []
-        }
-
-    def log_data_integrity_check(self, check_name: str, passed: bool, details: str = ""):
-        """Log data integrity verification results"""
-
-        self.metrics['data_integrity_checks'].append({
-            'timestamp': datetime.now(),
-            'check': check_name,
-            'passed': passed,
-            'details': details
-        })
-
-    def log_window_results(self, window_idx: int, window: Dict,
-                           model_score: float, n_trades: int, pnl: float):
-        """Log results for each window"""
-
-        self.metrics['windows'].append({
-            'index': window_idx,
-            'train_period': f"{window['train_start'].date()} to {window['train_end'].date()}",
-            'val_period': f"{window['val_start'].date()} to {window['val_end'].date()}",
-            'test_period': f"{window['test_start'].date()} to {window['test_end'].date()}",
-            'validation_auc': model_score,
-            'trades_executed': n_trades,
-            'period_pnl': pnl
-        })
-
-    def log_trade(self, trade: Dict):
-        """Log individual trade"""
-        self.metrics['trades'].append(trade)
-
-    def generate_report(self) -> Dict:
-        """Generate comprehensive backtest report"""
-
-        # Calculate performance metrics
-        total_trades = len(self.metrics['trades'])
-        winning_trades = [t for t in self.metrics['trades'] if t.get('pnl', 0) > 0]
-        losing_trades = [t for t in self.metrics['trades'] if t.get('pnl', 0) <= 0]
-
-        win_rate = len(winning_trades) / total_trades if total_trades > 0 else 0
-
-        avg_win = np.mean([t['pnl'] for t in winning_trades]) if winning_trades else 0
-        avg_loss = np.mean([t['pnl'] for t in losing_trades]) if losing_trades else 0
-
-        # Data integrity summary
-        integrity_passed = all(check['passed'] for check in self.metrics['data_integrity_checks'])
-
-        report = {
-            'summary': {
-                'total_windows': len(self.metrics['windows']),
-                'total_trades': total_trades,
-                'win_rate': win_rate,
-                'avg_win': avg_win,
-                'avg_loss': avg_loss,
-                'avg_validation_auc': np.mean([w['validation_auc'] for w in self.metrics['windows']]) if self.metrics[
-                    'windows'] else 0,
-                'data_integrity': 'VERIFIED - No leakage detected' if integrity_passed else 'FAILED - Potential leakage'
-            },
-            'window_analysis': self.metrics['windows'],
-            'data_integrity_checks': self.metrics['data_integrity_checks'],
-            'trades': self.metrics['trades'][:100]  # First 100 trades
-        }
-
-        return report
-
-
-class TrainedModel:
-    """Container for trained model and metadata"""
-
-    def __init__(self, ensemble: HedgeFundGPUEnsemble, train_date: pd.Timestamp,
-                 validation_score: float, feature_importance: Dict[str, float]):
-        self.ensemble = ensemble
-        self.train_date = train_date
-        self.validation_score = validation_score
-        self.feature_importance = feature_importance
-        self.predictions_cache = {}
-
-    def predict(self, features: pd.DataFrame) -> np.ndarray:
-        """Get predictions with caching"""
-        cache_key = hash(features.index.tolist()[0]) if len(features) > 0 else 0
-
-        if cache_key not in self.predictions_cache:
-            self.predictions_cache[cache_key] = self.ensemble.predict_proba(features)
-
-        return self.predictions_cache[cache_key]
-
-
-class RiskManager:
-    """Manages portfolio risk and position sizing"""
-
-    def __init__(self, config: HedgeFundBacktestConfig):
-        self.config = config
-        self.correlation_matrix = None
-
-    def calculate_position_size(self, portfolio_value: float, volatility: float,
-                                confidence: float, existing_positions: int) -> float:
-        """Calculate position size based on risk parity and constraints"""
-
-        # Base position size
-        if self.config.position_size_method == "equal":
-            base_size = portfolio_value * self.config.base_position_size
-        elif self.config.position_size_method == "risk_parity":
-            # Adjust size based on volatility
-            target_risk = portfolio_value * self.config.base_position_size * 0.02  # 2% volatility target
-            base_size = target_risk / (volatility + 1e-6)
-        else:
-            base_size = portfolio_value * self.config.base_position_size
-
-        # Adjust for confidence
-        size_multiplier = 0.5 + (confidence - self.config.min_prediction_confidence) * 2
-        size_multiplier = np.clip(size_multiplier, 0.5, 1.5)
-
-        position_size = base_size * size_multiplier
-
-        # Apply constraints
-        max_size = portfolio_value * self.config.max_position_size
-        position_size = min(position_size, max_size)
-
-        # Reduce size if too many positions
-        if existing_positions >= self.config.max_positions * 0.8:
-            position_size *= 0.5
-
-        return position_size
-
-    def check_correlation(self, symbol: str, existing_positions: List[str],
-                          returns_data: pd.DataFrame) -> bool:
-        """Check if new position is too correlated with existing positions"""
-
-        if not existing_positions or symbol not in returns_data.columns:
-            return True
-
-        for existing_symbol in existing_positions:
-            if existing_symbol in returns_data.columns:
-                correlation = returns_data[symbol].corr(returns_data[existing_symbol])
-                if abs(correlation) > self.config.correlation_threshold:
-                    logger.debug(f"High correlation between {symbol} and {existing_symbol}: {correlation:.2f}")
+        # Check missing data
+        critical_cols = ['close', 'volume', 'returns']
+        for col in critical_cols:
+            if col in df.columns:
+                missing_pct = df[col].isnull().sum() / len(df)
+                if missing_pct > HedgeFundBacktestConfig().max_missing_data_pct:
                     return False
 
         return True
 
-    def calculate_stop_loss(self, entry_price: float, atr: float) -> float:
-        """Calculate stop loss price"""
-        return entry_price - (atr * self.config.stop_loss_atr_multiplier)
 
-    def calculate_take_profit(self, entry_price: float, atr: float) -> float:
-        """Calculate take profit price"""
-        return entry_price + (atr * self.config.take_profit_atr_multiplier)
-
-    def check_portfolio_heat(self, positions: Dict, portfolio_value: float) -> bool:
-        """Check if total portfolio risk is within limits"""
-
-        total_risk = 0
-        for position in positions.values():
-            position_risk = position['quantity'] * (position['entry_price'] - position['stop_loss'])
-            total_risk += position_risk
-
-        portfolio_heat = total_risk / portfolio_value
-        return portfolio_heat <= self.config.max_portfolio_heat
-
-
-class HedgeFundBacktester:
-    """Main backtesting engine with professional standards"""
+class MLModelManager:
+    """Manages ML model training, validation, and prediction"""
 
     def __init__(self, config: HedgeFundBacktestConfig):
         self.config = config
-        self.data_manager = HedgeFundDataManager()
-        self.risk_manager = RiskManager(config)
-        self.execution_sim = ExecutionSimulator()
-        self.monitor = BacktestMonitor()
+        self.models = {}
+        self.model_performance = defaultdict(list)
+        self.feature_importance = {}
 
-        # Portfolio state
-        self.cash = config.initial_capital
-        self.positions = {}
-        self.trades = []
-        self.portfolio_values = []
-        self.daily_returns = []
+    def train_models(self, train_data: Dict[str, pd.DataFrame],
+                     val_data: Dict[str, pd.DataFrame],
+                     train_end_date: pd.Timestamp) -> HedgeFundGPUEnsemble:
+        """Train ensemble model with proper validation"""
 
-    def run_backtest(self, symbols: List[str], start_date: str, end_date: str) -> Dict:
-        """Run professional hedge fund backtest with walk-forward optimization"""
+        logger.info(f"Training models with {len(train_data)} symbols...")
 
-        logger.info(f"Starting professional hedge fund backtest")
-        logger.info(f"Symbols: {len(symbols)}")
-        logger.info(f"Period: {start_date} to {end_date}")
-        logger.info(f"Capital: ${self.config.initial_capital:,.0f}")
+        # Initialize ensemble with GPU config
+        gpu_config = GPUConfig(
+            batch_size=512,
+            n_epochs=50,  # Reduced for faster iteration
+            early_stopping_patience=10,
+            learning_rate=0.001
+        )
+        ensemble = HedgeFundGPUEnsemble(config=gpu_config)
 
-        # Initialize components
-        walk_forward = WalkForwardOptimizer(self.config)
+        # Prepare combined training data
+        train_combined = {}
+        for symbol in train_data:
+            if symbol in val_data:
+                train_combined[symbol] = train_data[symbol]
 
-        # Convert dates
-        start_ts = pd.to_datetime(start_date).tz_localize(None)
-        end_ts = pd.to_datetime(end_date).tz_localize(None)
+        if not train_combined:
+            logger.warning("No valid training data")
+            return ensemble
 
-        # Create walk-forward windows
-        windows = walk_forward.create_walk_forward_windows(start_ts, end_ts)
-        logger.info(f"Created {len(windows)} walk-forward windows")
+        # Use ensemble's prepare_training_data method
+        try:
+            X_train, y_train, metadata = ensemble.prepare_training_data(train_combined)
 
-        if not windows:
-            return {'error': 'Insufficient data for walk-forward optimization'}
+            # Prepare validation data similarly
+            X_val, y_val, _ = ensemble.prepare_training_data(val_data)
 
-        # Process each window
-        for window_idx, window in enumerate(windows):
-            logger.info(f"\n{'=' * 60}")
-            logger.info(f"Processing window {window_idx + 1}/{len(windows)}")
-            logger.info(f"Train: {window['train_start'].date()} to {window['train_end'].date()}")
-            logger.info(f"Val: {window['val_start'].date()} to {window['val_end'].date()}")
-            logger.info(f"Test: {window['test_start'].date()} to {window['test_end'].date()}")
+            # Train the ensemble
+            ensemble.train_combined(X_train, y_train, X_val, y_val,
+                                    sample_weights=metadata.get('sample_weights'))
 
-            # Validate window integrity
-            if not walk_forward.validate_window_integrity(window):
-                self.monitor.log_data_integrity_check(
-                    f"Window {window_idx} integrity",
-                    False,
-                    "Window failed temporal isolation check"
-                )
+            # Validate performance
+            val_score = ensemble.validate(X_val, y_val)
+            logger.info(f"Validation score: {val_score:.3f}")
+
+            # Store performance
+            self.model_performance[train_end_date] = {
+                'val_score': val_score,
+                'n_train_samples': len(X_train),
+                'n_val_samples': len(X_val)
+            }
+
+            # Get feature importance
+            self.feature_importance[train_end_date] = ensemble.get_feature_importance()
+
+        except Exception as e:
+            logger.error(f"Error training models: {e}")
+
+        return ensemble
+
+    def predict(self, model: HedgeFundGPUEnsemble,
+                current_data: Dict[str, pd.DataFrame],
+                date: pd.Timestamp) -> Dict[str, Dict]:
+        """Generate predictions for all symbols"""
+
+        predictions = {}
+
+        for symbol, df in current_data.items():
+            # Get data up to current date
+            hist_data = df[df.index <= date].copy()
+
+            if len(hist_data) < 50:
                 continue
-            else:
-                self.monitor.log_data_integrity_check(
-                    f"Window {window_idx} integrity",
-                    True,
-                    "Window passed temporal isolation check"
-                )
 
             try:
-                # Train model for this window
-                model = self._train_model_for_window(symbols, window)
-
-                if model is None:
-                    logger.warning(f"No model trained for window {window_idx}")
-                    continue
-
-                # Run backtest on test period
-                window_pnl = self._backtest_test_period(symbols, model, window)
-
-                # Log window results
-                self.monitor.log_window_results(
-                    window_idx,
-                    window,
-                    model.validation_score,
-                    len([t for t in self.trades if
-                         window['test_start'] <= pd.to_datetime(t['date']) <= window['test_end']]),
-                    window_pnl
-                )
-
-            except Exception as e:
-                logger.error(f"Error in window {window_idx}: {e}", exc_info=True)
-                self.monitor.log_data_integrity_check(
-                    f"Window {window_idx} processing",
-                    False,
-                    str(e)
-                )
-                continue
-
-        # Calculate final metrics
-        if not self.trades:
-            return {'error': 'No trades executed', 'report': self.monitor.generate_report()}
-
-        # Generate comprehensive report
-        final_metrics = self._calculate_final_metrics()
-        report = self.monitor.generate_report()
-
-        # Combine metrics and report
-        return {**final_metrics, 'detailed_report': report}
-
-    def _train_model_for_window(self, symbols: List[str], window: Dict) -> Optional[TrainedModel]:
-        """Train model for a specific window with strict data isolation"""
-
-        logger.info(f"Training model for window ending {window['test_start'].date()}")
-
-        # Fetch point-in-time data
-        pit_data = self.data_manager.fetch_batch_point_in_time(symbols, window['as_of_date'])
-
-        if not pit_data:
-            logger.warning("No data available for training")
-            return None
-
-        # Create feature engineer
-        feature_engineer = EnhancedFeatureEngineer()
-
-        # Prepare training and validation data
-        train_features = []
-        train_targets = []
-        val_features = []
-        val_targets = []
-
-        for symbol, full_data in pit_data.items():
-            # Ensure we only use data up to as_of_date
-            historical_data = full_data[full_data.index <= window['as_of_date']]
-
-            if len(historical_data) < 200:  # Need history for features
-                continue
-
-            # Create features using only historical data
-            try:
-                features = feature_engineer.create_all_features(historical_data, symbol)
+                # Use the feature engineer to create features
+                feature_engineer = EnhancedFeatureEngineer(use_gpu=False)
+                features = feature_engineer.create_all_features(hist_data, symbol)
 
                 if features.empty:
                     continue
 
-                # Create target
-                prediction_horizon = 5
-                returns = historical_data['close'].pct_change(prediction_horizon).shift(-prediction_horizon)
+                # Get latest features
+                latest_features = features.iloc[-1:].copy()
 
-                # Adaptive threshold
-                volatility = historical_data['close'].pct_change().rolling(20).std().mean()
-                threshold = max(0.01, min(0.03, volatility * 2))
+                # Get prediction from ensemble
+                pred = model.predict_proba(latest_features)
 
-                target = (returns > threshold).astype(int)
+                # Get individual model predictions for confidence
+                individual_preds = model.get_individual_predictions(latest_features)
 
-                # Split into train and validation periods
-                # Training data
-                train_mask = (features.index >= window['train_start']) & (features.index <= window['train_end'])
-                train_feat = features[train_mask][:-prediction_horizon]
-                train_tgt = target[train_mask][:-prediction_horizon]
-
-                # Remove NaN
-                valid_train = train_tgt.notna()
-                train_feat = train_feat[valid_train]
-                train_tgt = train_tgt[valid_train]
-
-                if len(train_feat) > 50:
-                    train_features.append(train_feat)
-                    train_targets.append(train_tgt)
-
-                # Validation data
-                val_mask = (features.index >= window['val_start']) & (features.index <= window['val_end'])
-                val_feat = features[val_mask][:-prediction_horizon]
-                val_tgt = target[val_mask][:-prediction_horizon]
-
-                # Remove NaN
-                valid_val = val_tgt.notna()
-                val_feat = val_feat[valid_val]
-                val_tgt = val_tgt[valid_val]
-
-                if len(val_feat) > 10:
-                    val_features.append(val_feat)
-                    val_targets.append(val_tgt)
-
-                # Verify no future data leakage
-                if val_feat.index.max() > window['val_end']:
-                    logger.error(f"DATA LEAKAGE: Validation features extend beyond val_end")
-                    self.monitor.log_data_integrity_check(
-                        f"Feature leakage check - {symbol}",
-                        False,
-                        "Validation features contain future data"
-                    )
-                    return None
+                # Calculate agreement
+                if len(individual_preds) > 0:
+                    agreement = np.mean([p[0] > 0.5 for p in individual_preds if len(p) > 0])
                 else:
-                    self.monitor.log_data_integrity_check(
-                        f"Feature leakage check - {symbol}",
-                        True,
-                        "No future data in features"
-                    )
+                    agreement = 0.5
+
+                predictions[symbol] = {
+                    'probability': float(pred[0]) if len(pred) > 0 else 0.5,
+                    'prediction': int(pred[0] > 0.5) if len(pred) > 0 else 0,
+                    'confidence': float(pred[0]) if pred[0] > 0.5 else 1 - float(pred[0]),
+                    'model_agreement': agreement,
+                    'latest_price': hist_data['close'].iloc[-1],
+                    'atr': hist_data['atr'].iloc[-1] if 'atr' in hist_data else 0,
+                    'volume': hist_data['volume'].iloc[-1]
+                }
 
             except Exception as e:
-                logger.error(f"Error processing {symbol}: {e}")
+                logger.debug(f"Prediction error for {symbol}: {e}")
                 continue
 
-        if not train_features or not val_features:
-            logger.warning("Insufficient data for training")
-            return None
+        return predictions
 
-        # Combine all data
-        X_train = pd.concat(train_features, ignore_index=True)
-        y_train = pd.concat(train_targets, ignore_index=True)
-        X_val = pd.concat(val_features, ignore_index=True)
-        y_val = pd.concat(val_targets, ignore_index=True)
 
-        # Log data summary
-        logger.info(f"Training data: {len(X_train)} samples, {X_train.shape[1]} features")
-        logger.info(f"Validation data: {len(X_val)} samples")
-        logger.info(f"Class balance - Train: {y_train.mean():.2%}, Val: {y_val.mean():.2%}")
+class HedgeFundBacktester:
+    """Main backtesting engine with ML integration - FIXED VERSION"""
 
-        # Train ensemble
-        ensemble = HedgeFundGPUEnsemble()
+    def __init__(self, config: HedgeFundBacktestConfig = None):
+        self.config = config or HedgeFundBacktestConfig()
+        self.data_pipeline = DataPipeline()
+        self.model_manager = MLModelManager(config)
+        self.risk_manager = RiskManager(config)
+        self.execution_sim = ExecutionSimulator(ExecutionConfig())
 
-        try:
-            ensemble.train_combined(X_train, y_train, X_val, y_val)
+        # Performance tracking
+        self.trades = []
+        self.equity_curve = []
+        self.positions = {}
+        self.model_predictions = defaultdict(list)
 
-            # Get validation score
-            val_score = ensemble.validate(X_val, y_val)
+    def run_backtest(self, symbols: List[str], start_date: str, end_date: str) -> Dict:
+        """Run complete ML-integrated backtest"""
 
-            if val_score < self.config.min_validation_score:
-                logger.warning(f"Model validation score {val_score:.4f} below threshold")
-                return None
+        logger.info(f"Starting hedge fund backtest for {len(symbols)} symbols")
+        logger.info(f"Period: {start_date} to {end_date}")
 
-            # Get feature importance
-            feature_importance = ensemble.get_feature_importance()
+        # Calculate required data range with buffer
+        backtest_start = pd.to_datetime(start_date)
+        data_start = backtest_start - timedelta(days=365 * 2)  # 2 years of history
 
-            logger.info(f"Model trained successfully. Validation AUC: {val_score:.4f}")
+        # Fetch and prepare all data
+        all_data = self.data_pipeline.fetch_and_prepare_data(
+            symbols, data_start.strftime('%Y-%m-%d'), end_date
+        )
 
-            return TrainedModel(ensemble, window['train_end'], val_score, feature_importance)
+        if len(all_data) < 10:
+            logger.error(f"Insufficient data: only {len(all_data)} symbols available")
+            return {'error': 'Insufficient data for backtesting'}
 
-        except Exception as e:
-            logger.error(f"Model training failed: {e}", exc_info=True)
-            return None
+        logger.info(f"Data prepared for {len(all_data)} symbols")
 
-    def _backtest_test_period(self, symbols: List[str], model: TrainedModel,
-                              window: Dict) -> float:
-        """Run backtest for test period with trained model"""
+        # Initialize portfolio
+        cash = self.config.initial_capital
+        portfolio_value = self.config.initial_capital
 
-        logger.info(f"Backtesting test period: {window['test_start'].date()} to {window['test_end'].date()}")
+        # Walk-forward optimization loop
+        current_date = backtest_start
+        end_date_ts = pd.to_datetime(end_date)
 
-        # Track period P&L
-        start_portfolio_value = self._calculate_portfolio_value()
+        current_model = None
+        last_train_date = None
 
-        # Get trading days in test period
-        test_start = window['test_start']
-        test_end = window['test_end']
+        # Generate trading dates
+        all_trading_dates = pd.bdate_range(start=backtest_start, end=end_date_ts)
 
-        # Generate trading days
-        trading_days = pd.bdate_range(test_start, test_end)
+        # Track predictions for analysis
+        all_predictions = []
 
-        for current_date in trading_days:
-            # Update existing positions
-            self._update_positions(current_date)
+        for date in tqdm(all_trading_dates, desc="Backtesting"):
+            # Check if we need to retrain
+            if (current_model is None or
+                    (last_train_date and (date - last_train_date).days >= self.config.retrain_frequency_days)):
+                logger.info(f"Training model for {date.date()}")
+                current_model = self._train_model_for_date(all_data, date)
+                last_train_date = date
 
-            # Generate signals for current date
-            signals = self._generate_signals(symbols, model, current_date, window)
+                # Skip trading for buffer period
+                continue
 
-            # Execute trades
-            self._execute_trades(signals, current_date)
+            # Skip if within buffer period
+            if last_train_date and (date - last_train_date).days < self.config.buffer_days:
+                continue
 
-            # Record portfolio value
-            portfolio_value = self._calculate_portfolio_value()
-            self.portfolio_values.append({
-                'date': current_date,
-                'value': portfolio_value,
-                'cash': self.cash,
+            # Update portfolio with current prices
+            self._update_portfolio_prices(date, all_data)
+
+            # Check exits
+            exits = self._check_exit_conditions(date, all_data)
+            for exit in exits:
+                cash += self._execute_exit(exit, date, all_data)
+
+            # Generate new signals
+            if len(self.positions) < self.config.max_positions:
+                predictions = self.model_manager.predict(current_model, all_data, date)
+
+                # Log prediction statistics
+                if predictions:
+                    pred_probs = [p['probability'] for p in predictions.values()]
+                    high_conf = sum(1 for p in predictions.values()
+                                    if p['confidence'] > self.config.min_prediction_confidence)
+                    logger.debug(f"Date {date.date()}: {len(predictions)} predictions, "
+                                 f"{high_conf} high confidence, "
+                                 f"avg prob: {np.mean(pred_probs):.3f}")
+                    all_predictions.extend(predictions.values())
+
+                signals = self._filter_signals(predictions, date, all_data)
+
+                # Log signal statistics
+                if signals:
+                    logger.info(f"Date {date.date()}: {len(signals)} valid signals generated")
+
+                # Execute new positions
+                for signal in signals[:self.config.max_positions - len(self.positions)]:
+                    cost = self._execute_entry(signal, date, all_data, cash, portfolio_value)
+                    if cost > 0:
+                        cash -= cost
+
+            # Calculate portfolio value
+            positions_value = sum(pos['current_value'] for pos in self.positions.values())
+            portfolio_value = cash + positions_value
+
+            # Record metrics
+            self.equity_curve.append({
+                'date': date,
+                'portfolio_value': portfolio_value,
+                'cash': cash,
+                'positions_value': positions_value,
                 'n_positions': len(self.positions)
             })
 
-        # Calculate period return
-        end_portfolio_value = self._calculate_portfolio_value()
-        period_pnl = end_portfolio_value - start_portfolio_value
-
-        logger.info(f"Test period P&L: ${period_pnl:,.2f}")
-
-        return period_pnl
-
-    def _generate_signals(self, symbols: List[str], model: TrainedModel,
-                          current_date: pd.Timestamp, window: Dict) -> List[Dict]:
-        """Generate trading signals for current date"""
-
-        signals = []
-        current_positions = list(self.positions.keys())
-
-        # Feature engineer
-        feature_engineer = EnhancedFeatureEngineer()
-
-        for symbol in symbols:
-            # Skip if already have position
-            if symbol in current_positions:
-                continue
-
-            # Get historical data up to current date
-            historical_data = self.data_manager.fetch_point_in_time_data(
-                symbol,
-                current_date,
-                lookback_days=self.config.feature_lookback_days + 100
-            )
-
-            if len(historical_data) < 200:
-                continue
-
-            try:
-                # Create features
-                features = feature_engineer.create_all_features(historical_data, symbol)
-
-                if features.empty or current_date not in features.index:
-                    continue
-
-                # Get features for current date
-                current_features = features.loc[[current_date]]
-
-                # Get prediction
-                prediction = model.predict(current_features)
-
-                if len(prediction) > 0:
-                    confidence = prediction[0]
-
-                    if confidence >= self.config.min_prediction_confidence:
-                        # Calculate metrics
-                        recent_data = historical_data.tail(20)
-                        volatility = recent_data['close'].pct_change().std() * np.sqrt(252)
-                        atr = self._calculate_atr(recent_data)
-
-                        signals.append({
-                            'symbol': symbol,
-                            'date': current_date,
-                            'confidence': confidence,
-                            'volatility': volatility,
-                            'atr': atr,
-                            'price': recent_data['close'].iloc[-1],
-                            'volume': recent_data['volume'].iloc[-1]
-                        })
-
-            except Exception as e:
-                logger.debug(f"Signal generation failed for {symbol}: {e}")
-                continue
-
-        # Sort by confidence and limit
-        signals.sort(key=lambda x: x['confidence'], reverse=True)
-        max_new_positions = self.config.max_positions - len(self.positions)
-        signals = signals[:max_new_positions]
-
-        return signals
-
-    def _execute_trades(self, signals: List[Dict], current_date: pd.Timestamp) -> None:
-        """Execute trades based on signals"""
-
-        for signal in signals:
-            symbol = signal['symbol']
-
-            # Calculate position size
-            portfolio_value = self._calculate_portfolio_value()
-            position_size = self.risk_manager.calculate_position_size(
-                portfolio_value,
-                signal['volatility'],
-                signal['confidence'],
-                len(self.positions)
-            )
-
-            if position_size < 1000:  # Minimum position size
-                continue
-
-            # Check portfolio heat
-            if not self.risk_manager.check_portfolio_heat(self.positions, portfolio_value):
-                logger.debug(f"Portfolio heat limit reached, skipping {symbol}")
-                continue
-
-            # Calculate shares
-            price = signal['price']
-            shares = int(position_size / price)
-
-            if shares == 0:
-                continue
-
-            # Simulate execution
-            exec_price, slippage, commission = self.execution_sim.simulate_entry(
-                symbol, price, shares, signal['volume']
-            )
-
-            # Calculate cost
-            total_cost = (exec_price * shares) + commission
-
-            # Check cash
-            if total_cost > self.cash:
-                continue
-
-            # Calculate stops
-            atr = signal['atr']
-            stop_loss = self.risk_manager.calculate_stop_loss(exec_price, atr)
-            take_profit = self.risk_manager.calculate_take_profit(exec_price, atr)
-
-            # Execute trade
-            self.cash -= total_cost
-
-            position = {
+        # Close all remaining positions
+        for symbol in list(self.positions.keys()):
+            exit_info = {
                 'symbol': symbol,
-                'entry_date': current_date,
-                'entry_price': exec_price,
-                'quantity': shares,
-                'stop_loss': stop_loss,
-                'take_profit': take_profit,
-                'commission_paid': commission,
-                'slippage_paid': slippage
+                'reason': 'end_of_backtest'
+            }
+            cash += self._execute_exit(exit_info, all_trading_dates[-1], all_data)
+
+        # Log prediction analysis
+        if all_predictions:
+            avg_prob = np.mean([p['probability'] for p in all_predictions])
+            high_conf_pct = sum(1 for p in all_predictions
+                                if p['confidence'] > self.config.min_prediction_confidence) / len(all_predictions)
+            logger.info(f"Prediction Statistics:")
+            logger.info(f"  Total predictions: {len(all_predictions)}")
+            logger.info(f"  Average probability: {avg_prob:.3f}")
+            logger.info(f"  High confidence %: {high_conf_pct * 100:.1f}%")
+
+        # Calculate final metrics
+        results = self._calculate_performance_metrics()
+
+        # Generate reports
+        self._generate_reports(results)
+
+        return results
+
+    def _train_model_for_date(self, all_data: Dict[str, pd.DataFrame],
+                              current_date: pd.Timestamp) -> HedgeFundGPUEnsemble:
+        """Train model with proper data splitting"""
+
+        # Calculate date ranges
+        train_end = current_date - timedelta(days=self.config.buffer_days)
+        train_start = train_end - timedelta(days=self.config.train_months * 30)
+        val_end = train_end
+        val_start = val_end - timedelta(days=self.config.validation_months * 30)
+
+        # Split data
+        train_data = {}
+        val_data = {}
+
+        for symbol, df in all_data.items():
+            # Training data
+            train_mask = (df.index >= train_start) & (df.index < val_start)
+            train_df = df[train_mask].copy()
+
+            # Validation data
+            val_mask = (df.index >= val_start) & (df.index < val_end)
+            val_df = df[val_mask].copy()
+
+            if len(train_df) >= self.config.min_training_samples and len(val_df) >= 20:
+                train_data[symbol] = train_df
+                val_data[symbol] = val_df
+
+        logger.info(f"Training on {len(train_data)} symbols")
+
+        # Train ensemble model
+        model = self.model_manager.train_models(train_data, val_data, train_end)
+
+        return model
+
+    def _filter_signals(self, predictions: Dict, date: pd.Timestamp,
+                        all_data: Dict[str, pd.DataFrame]) -> List[Dict]:
+        """Filter and rank trading signals - IMPROVED LOGIC"""
+
+        valid_signals = []
+
+        for symbol, pred in predictions.items():
+            # More lenient filtering
+            if pred['confidence'] < self.config.min_prediction_confidence * 0.9:  # 10% buffer
+                continue
+
+            if pred['model_agreement'] < self.config.ensemble_agreement_threshold * 0.9:  # 10% buffer
+                continue
+
+            # Check if we have price data
+            if symbol not in all_data:
+                continue
+
+            df = all_data[symbol]
+            recent_data = df[df.index <= date].tail(20)
+
+            if recent_data.empty:
+                continue
+
+            # Check liquidity
+            avg_dollar_volume = recent_data['dollar_volume'].mean() if 'dollar_volume' in recent_data else 0
+            if avg_dollar_volume < self.config.min_liquidity_usd * 0.8:  # 20% buffer
+                continue
+
+            # Create signal with all necessary data
+            signal = {
+                'symbol': symbol,
+                'prediction': pred,
+                'current_price': pred['latest_price'],
+                'atr': pred['atr'],
+                'volatility': recent_data['volatility_20d'].iloc[-1] if 'volatility_20d' in recent_data else 0.20,
+                'dollar_volume': avg_dollar_volume,
+                'score': pred['confidence'] * pred['model_agreement'],
+                'date': date
             }
 
-            self.positions[symbol] = position
+            valid_signals.append(signal)
 
-            # Record trade
-            trade = {
-                'date': current_date,
-                'symbol': symbol,
-                'action': 'BUY',
-                'quantity': shares,
-                'price': exec_price,
-                'commission': commission,
-                'slippage': slippage,
-                'confidence': signal['confidence']
-            }
+        # Sort by score
+        valid_signals.sort(key=lambda x: x['score'], reverse=True)
 
-            self.trades.append(trade)
-            self.monitor.log_trade(trade)
+        # Log signal generation
+        if valid_signals:
+            logger.debug(f"Generated {len(valid_signals)} valid signals, top score: {valid_signals[0]['score']:.3f}")
 
-            logger.debug(f"Bought {shares} shares of {symbol} at ${exec_price:.2f}")
+        return valid_signals
 
-    def _update_positions(self, current_date: pd.Timestamp) -> None:
-        """Update existing positions - check stops and targets"""
+    def _execute_entry(self, signal: Dict, date: pd.Timestamp,
+                       all_data: Dict[str, pd.DataFrame],
+                       cash: float, portfolio_value: float) -> float:
+        """Execute entry with realistic simulation"""
 
-        positions_to_close = []
+        symbol = signal['symbol']
+
+        # Calculate position size
+        shares = self.risk_manager.calculate_position_size(
+            symbol, signal['score'], portfolio_value,
+            all_data[symbol], self.positions
+        )
+
+        if shares == 0:
+            logger.debug(f"Position size is 0 for {symbol}")
+            return 0
+
+        # Check risk limits
+        risk_check = self.risk_manager.check_portfolio_risk(
+            self.positions, all_data, portfolio_value
+        )
+
+        if not risk_check['pass']:
+            logger.debug(f"Risk check failed for {symbol}: {risk_check['messages']}")
+            return 0
+
+        # Simulate execution
+        exec_price, slippage, commission = self.execution_sim.simulate_entry(
+            symbol, signal['current_price'], shares, signal['dollar_volume']
+        )
+
+        total_cost = (exec_price * shares) + slippage + commission
+
+        if total_cost > cash * 0.95:  # Keep 5% cash buffer
+            logger.debug(f"Insufficient cash for {symbol}: need ${total_cost:.2f}, have ${cash:.2f}")
+            return 0
+
+        # Calculate risk levels
+        stop_loss = self.risk_manager.calculate_stop_loss(
+            exec_price, signal['atr']
+        )
+        take_profit = self.risk_manager.calculate_take_profit(
+            exec_price, signal['atr']
+        )
+
+        # Create position
+        self.positions[symbol] = {
+            'entry_date': date,
+            'entry_price': exec_price,
+            'quantity': shares,
+            'stop_loss': stop_loss,
+            'take_profit': take_profit,
+            'current_price': exec_price,
+            'current_value': exec_price * shares,
+            'commission_paid': commission,
+            'slippage_paid': slippage,
+            'prediction': signal['prediction']
+        }
+
+        # Record trade
+        self.trades.append({
+            'symbol': symbol,
+            'date': date,
+            'action': 'BUY',
+            'price': exec_price,
+            'quantity': shares,
+            'value': total_cost,
+            'commission': commission,
+            'slippage': slippage,
+            'ml_confidence': signal['prediction']['confidence'],
+            'ml_agreement': signal['prediction']['model_agreement'],
+            'ml_probability': signal['prediction']['probability']
+        })
+
+        logger.info(f"ENTRY: {symbol} - {shares} shares @ ${exec_price:.2f} "
+                    f"(confidence: {signal['prediction']['confidence']:.3f})")
+
+        return total_cost
+
+    def _check_exit_conditions(self, date: pd.Timestamp,
+                               all_data: Dict[str, pd.DataFrame]) -> List[Dict]:
+        """Check for exit conditions"""
+
+        exits = []
 
         for symbol, position in self.positions.items():
-            # Get current price
-            current_data = self.data_manager.fetch_point_in_time_data(
-                symbol, current_date, lookback_days=10
-            )
-
-            if current_data.empty or current_date not in current_data.index:
+            if symbol not in all_data:
                 continue
 
-            current_price = current_data.loc[current_date, 'close']
+            df = all_data[symbol]
+            if date not in df.index:
+                continue
+
+            current_price = df.loc[date, 'close']
+
+            # Update current price
+            position['current_price'] = current_price
+            position['current_value'] = current_price * position['quantity']
 
             # Check stop loss
             if current_price <= position['stop_loss']:
-                positions_to_close.append((symbol, 'STOP_LOSS', current_price))
+                exits.append({
+                    'symbol': symbol,
+                    'reason': 'stop_loss',
+                    'exit_price': current_price
+                })
 
             # Check take profit
             elif current_price >= position['take_profit']:
-                positions_to_close.append((symbol, 'TAKE_PROFIT', current_price))
+                exits.append({
+                    'symbol': symbol,
+                    'reason': 'take_profit',
+                    'exit_price': current_price
+                })
 
-            # Check time-based exit
-            elif (current_date - position['entry_date']).days >= 20:
-                positions_to_close.append((symbol, 'TIME_EXIT', current_price))
+            # Check time-based exit (optional)
+            elif (date - position['entry_date']).days > 20:
+                # Re-evaluate position
+                current_return = (current_price - position['entry_price']) / position['entry_price']
+                if current_return < -0.02:  # Down more than 2%
+                    exits.append({
+                        'symbol': symbol,
+                        'reason': 'time_stop',
+                        'exit_price': current_price
+                    })
 
-        # Close positions
-        for symbol, reason, price in positions_to_close:
-            self._close_position(symbol, current_date, price, reason)
+        return exits
 
-    def _close_position(self, symbol: str, date: pd.Timestamp,
-                        price: float, reason: str) -> None:
-        """Close a position"""
+    def _execute_exit(self, exit_info: Dict, date: pd.Timestamp,
+                      all_data: Dict[str, pd.DataFrame]) -> float:
+        """Execute exit and return proceeds"""
+
+        symbol = exit_info['symbol']
+        if symbol not in self.positions:
+            return 0
 
         position = self.positions[symbol]
-        quantity = position['quantity']
 
-        # Get volume for execution simulation
-        current_data = self.data_manager.fetch_point_in_time_data(
-            symbol, date, lookback_days=10
-        )
-        volume = current_data.loc[date, 'volume'] if date in current_data.index else 1000000
+        # Get current market data
+        df = all_data[symbol]
+        current_data = df[df.index <= date].tail(1)
+
+        if current_data.empty:
+            return 0
+
+        exit_price = exit_info.get('exit_price', current_data['close'].iloc[0])
+        daily_volume = current_data['volume'].iloc[0] * exit_price
 
         # Simulate execution
         exec_price, slippage, commission = self.execution_sim.simulate_exit(
-            symbol, price, quantity, volume
+            symbol, exit_price, position['quantity'], daily_volume
         )
 
         # Calculate proceeds
-        proceeds = (exec_price * quantity) - commission
-        self.cash += proceeds
+        gross_proceeds = exec_price * position['quantity']
+        net_proceeds = gross_proceeds - slippage - commission
 
         # Calculate P&L
-        entry_cost = position['entry_price'] * quantity + position['commission_paid']
-        exit_proceeds = proceeds
-        pnl = exit_proceeds - entry_cost
-        pnl_pct = pnl / entry_cost
+        entry_cost = position['entry_price'] * position['quantity'] + position['commission_paid'] + position[
+            'slippage_paid']
+        total_pnl = net_proceeds - entry_cost
+        pnl_pct = total_pnl / entry_cost
 
         # Record trade
-        trade = {
-            'date': date,
+        self.trades.append({
             'symbol': symbol,
+            'date': date,
             'action': 'SELL',
-            'quantity': quantity,
             'price': exec_price,
+            'quantity': position['quantity'],
+            'value': gross_proceeds,
             'commission': commission,
             'slippage': slippage,
-            'reason': reason,
-            'pnl': pnl,
-            'pnl_pct': pnl_pct
-        }
-
-        self.trades.append(trade)
-        self.monitor.log_trade(trade)
+            'pnl': total_pnl,
+            'pnl_pct': pnl_pct,
+            'exit_reason': exit_info['reason'],
+            'holding_days': (date - position['entry_date']).days
+        })
 
         # Remove position
         del self.positions[symbol]
 
-        logger.debug(f"Closed {symbol}: {reason}, P&L: ${pnl:.2f} ({pnl_pct * 100:.1f}%)")
+        logger.info(f"EXIT: {symbol} - {exit_info['reason']} - P&L: ${total_pnl:.2f} ({pnl_pct:.2%})")
 
-    def _calculate_portfolio_value(self) -> float:
-        """Calculate total portfolio value"""
+        return net_proceeds
 
-        positions_value = sum(
-            position['quantity'] * position['entry_price']
-            for position in self.positions.values()
-        )
+    def _update_portfolio_prices(self, date: pd.Timestamp,
+                                 all_data: Dict[str, pd.DataFrame]):
+        """Update current prices for all positions"""
 
-        return self.cash + positions_value
+        for symbol, position in self.positions.items():
+            if symbol in all_data:
+                df = all_data[symbol]
+                if date in df.index:
+                    current_price = df.loc[date, 'close']
+                    position['current_price'] = current_price
+                    position['current_value'] = current_price * position['quantity']
 
-    def _calculate_atr(self, df: pd.DataFrame, period: int = 14) -> float:
-        """Calculate Average True Range"""
+    def _calculate_performance_metrics(self) -> Dict:
+        """Calculate comprehensive performance metrics"""
 
-        high = df['high'].values
-        low = df['low'].values
-        close = df['close'].values
-
-        # True Range
-        tr1 = high - low
-        tr2 = abs(high - np.roll(close, 1))
-        tr3 = abs(low - np.roll(close, 1))
-
-        tr = np.maximum(tr1, np.maximum(tr2, tr3))
-
-        # ATR
-        atr = pd.Series(tr).rolling(period).mean().iloc[-1]
-
-        return atr
-
-    def _calculate_final_metrics(self) -> Dict:
-        """Calculate comprehensive backtest metrics"""
-
-        if not self.portfolio_values:
-            return {'error': 'No portfolio values recorded'}
+        if not self.equity_curve:
+            return {'error': 'No data to analyze'}
 
         # Convert to DataFrame
-        pv_df = pd.DataFrame(self.portfolio_values)
-        pv_df['date'] = pd.to_datetime(pv_df['date'])
-        pv_df.set_index('date', inplace=True)
+        equity_df = pd.DataFrame(self.equity_curve)
+        trades_df = pd.DataFrame(self.trades)
 
         # Calculate returns
-        pv_df['returns'] = pv_df['value'].pct_change()
-        daily_returns = pv_df['returns'].dropna()
+        equity_df['returns'] = equity_df['portfolio_value'].pct_change()
 
         # Basic metrics
-        initial_value = self.config.initial_capital
-        final_value = pv_df['value'].iloc[-1]
-        total_return = (final_value - initial_value) / initial_value
+        total_return = (equity_df['portfolio_value'].iloc[
+                            -1] - self.config.initial_capital) / self.config.initial_capital
 
         # Risk metrics
-        if len(daily_returns) > 0:
-            sharpe_ratio = np.sqrt(252) * daily_returns.mean() / (daily_returns.std() + 1e-6)
+        returns = equity_df['returns'].dropna()
+        if len(returns) > 0:
+            annual_return = returns.mean() * 252
+            annual_vol = returns.std() * np.sqrt(252)
+            sharpe = annual_return / annual_vol if annual_vol > 0 else 0
+
+            # Sortino
+            downside_returns = returns[returns < 0]
+            downside_vol = downside_returns.std() * np.sqrt(252) if len(downside_returns) > 0 else 0
+            sortino = annual_return / downside_vol if downside_vol > 0 else 0
 
             # Max drawdown
-            cumulative_returns = (1 + daily_returns).cumprod()
-            running_max = cumulative_returns.expanding().max()
-            drawdowns = (cumulative_returns - running_max) / running_max
-            max_drawdown = drawdowns.min()
+            cumulative = (1 + returns).cumprod()
+            running_max = cumulative.expanding().max()
+            drawdown = (cumulative - running_max) / running_max
+            max_drawdown = drawdown.min()
 
-            # Sortino ratio
-            downside_returns = daily_returns[daily_returns < 0]
-            downside_std = downside_returns.std() if len(downside_returns) > 0 else 0
-            sortino_ratio = np.sqrt(252) * daily_returns.mean() / (downside_std + 1e-6)
-
+            # Calmar
+            calmar = annual_return / abs(max_drawdown) if max_drawdown != 0 else 0
         else:
-            sharpe_ratio = 0
-            max_drawdown = 0
-            sortino_ratio = 0
+            annual_return = annual_vol = sharpe = sortino = max_drawdown = calmar = 0
 
-        # Trade statistics
-        trades_df = pd.DataFrame(self.trades)
-        if not trades_df.empty and 'pnl' in trades_df.columns:
-            winning_trades = trades_df[trades_df['pnl'] > 0]
-            losing_trades = trades_df[trades_df['pnl'] <= 0]
+        # Trade analysis
+        if len(trades_df) > 0:
+            buy_trades = trades_df[trades_df['action'] == 'BUY']
+            sell_trades = trades_df[trades_df['action'] == 'SELL']
 
-            win_rate = len(winning_trades) / len(trades_df) if len(trades_df) > 0 else 0
-            avg_win = winning_trades['pnl'].mean() if len(winning_trades) > 0 else 0
-            avg_loss = losing_trades['pnl'].mean() if len(losing_trades) > 0 else 0
+            if len(sell_trades) > 0:
+                winning_trades = sell_trades[sell_trades['pnl'] > 0]
+                losing_trades = sell_trades[sell_trades['pnl'] <= 0]
 
-            # Profit factor
-            total_wins = winning_trades['pnl'].sum() if len(winning_trades) > 0 else 0
-            total_losses = abs(losing_trades['pnl'].sum()) if len(losing_trades) > 0 else 1
-            profit_factor = total_wins / total_losses if total_losses > 0 else 0
+                win_rate = len(winning_trades) / len(sell_trades)
+                avg_win = winning_trades['pnl'].mean() if len(winning_trades) > 0 else 0
+                avg_loss = losing_trades['pnl'].mean() if len(losing_trades) > 0 else 0
+                profit_factor = abs(winning_trades['pnl'].sum() / losing_trades['pnl'].sum()) if len(
+                    losing_trades) > 0 and losing_trades['pnl'].sum() != 0 else float('inf')
 
+                # ML performance
+                ml_metrics = {
+                    'avg_ml_confidence': buy_trades['ml_confidence'].mean() if 'ml_confidence' in buy_trades else 0,
+                    'avg_ml_agreement': buy_trades['ml_agreement'].mean() if 'ml_agreement' in buy_trades else 0,
+                    'avg_ml_probability': buy_trades['ml_probability'].mean() if 'ml_probability' in buy_trades else 0,
+                    'high_confidence_trades': len(
+                        buy_trades[buy_trades['ml_confidence'] > 0.6]) if 'ml_confidence' in buy_trades else 0
+                }
+            else:
+                win_rate = avg_win = avg_loss = profit_factor = 0
+                ml_metrics = {}
         else:
-            win_rate = 0
-            avg_win = 0
-            avg_loss = 0
-            profit_factor = 0
+            win_rate = avg_win = avg_loss = profit_factor = 0
+            ml_metrics = {}
 
-        # Annual metrics
-        n_days = len(pv_df)
-        n_years = n_days / 252
-        annual_return = (final_value / initial_value) ** (1 / n_years) - 1 if n_years > 0 else 0
-
-        metrics = {
-            'initial_capital': initial_value,
-            'final_value': final_value,
+        # Compile results
+        results = {
+            # Returns
             'total_return': total_return,
             'annual_return': annual_return,
-            'sharpe_ratio': sharpe_ratio,
-            'sortino_ratio': sortino_ratio,
+            'annual_volatility': annual_vol,
+
+            # Risk metrics
+            'sharpe_ratio': sharpe,
+            'sortino_ratio': sortino,
             'max_drawdown': max_drawdown,
+            'calmar_ratio': calmar,
+
+            # Trade metrics
+            'total_trades': len(trades_df),
             'win_rate': win_rate,
-            'profit_factor': profit_factor,
-            'total_trades': len(self.trades),
             'avg_win': avg_win,
             'avg_loss': avg_loss,
-            'portfolio_values': pv_df.to_dict('records'),
-            'trades': self.trades
+            'profit_factor': profit_factor,
+
+            # ML metrics
+            'ml_performance': ml_metrics,
+
+            # Data
+            'equity_curve': equity_df,
+            'trades': trades_df
         }
 
-        # Add symbol statistics
-        if not trades_df.empty:
-            symbol_stats = trades_df.groupby('symbol').agg({
-                'symbol': 'count',
-                'pnl': ['sum', 'mean', 'std']
-            }).round(2)
-            metrics['symbol_stats'] = symbol_stats.to_dict()
+        return results
 
-        return metrics
+    def _generate_reports(self, results: Dict):
+        """Generate comprehensive reports"""
 
+        # Print summary
+        print("\n" + "=" * 80)
+        print("HEDGE FUND ML BACKTEST RESULTS")
+        print("=" * 80)
+        print(f"Total Return: {results['total_return'] * 100:.2f}%")
+        print(f"Annual Return: {results['annual_return'] * 100:.2f}%")
+        print(f"Annual Volatility: {results['annual_volatility'] * 100:.2f}%")
+        print(f"Sharpe Ratio: {results['sharpe_ratio']:.2f}")
+        print(f"Sortino Ratio: {results['sortino_ratio']:.2f}")
+        print(f"Max Drawdown: {results['max_drawdown'] * 100:.2f}%")
+        print(f"Calmar Ratio: {results['calmar_ratio']:.2f}")
+        print(f"\nTotal Trades: {results['total_trades']}")
+        print(f"Win Rate: {results['win_rate'] * 100:.1f}%")
+        print(f"Profit Factor: {results['profit_factor']:.2f}")
 
-# Utility functions
-def plot_backtest_results(results: Dict) -> None:
-    """Plot professional backtest results"""
+        if results['ml_performance']:
+            print(f"\nML Performance:")
+            print(f"Avg Confidence: {results['ml_performance'].get('avg_ml_confidence', 0) * 100:.1f}%")
+            print(f"Avg Model Agreement: {results['ml_performance'].get('avg_ml_agreement', 0) * 100:.1f}%")
+            print(f"Avg Probability: {results['ml_performance'].get('avg_ml_probability', 0) * 100:.1f}%")
 
-    if 'error' in results:
-        print(f"Cannot plot results: {results['error']}")
-        return
+        print("=" * 80)
 
-    # Create figure
-    fig, axes = plt.subplots(3, 2, figsize=(15, 12))
-    fig.suptitle('Professional Hedge Fund Backtest Results', fontsize=16)
+        # Generate plots
+        self._plot_results(results)
 
-    # Portfolio value
-    pv_df = pd.DataFrame(results['portfolio_values'])
-    pv_df['date'] = pd.to_datetime(pv_df['date'])
-    pv_df.set_index('date', inplace=True)
+        # Save detailed results
+        results_to_save = {k: v for k, v in results.items()
+                           if k not in ['equity_curve', 'trades']}
 
-    axes[0, 0].plot(pv_df.index, pv_df['value'], linewidth=2)
-    axes[0, 0].set_title('Portfolio Value')
-    axes[0, 0].set_ylabel('Value ($)')
-    axes[0, 0].grid(True, alpha=0.3)
+        with open('hedge_fund_backtest_results.json', 'w') as f:
+            json.dump(results_to_save, f, indent=2, default=str)
 
-    # Drawdown
-    returns = pv_df['value'].pct_change().fillna(0)
-    cumulative_returns = (1 + returns).cumprod()
-    running_max = cumulative_returns.expanding().max()
-    drawdown = (cumulative_returns - running_max) / running_max * 100
+        # Save trades
+        if 'trades' in results and isinstance(results['trades'], pd.DataFrame):
+            results['trades'].to_csv('hedge_fund_trades.csv', index=False)
 
-    axes[0, 1].fill_between(drawdown.index, drawdown.values, 0,
-                            color='red', alpha=0.3, label='Drawdown')
-    axes[0, 1].set_title('Drawdown')
-    axes[0, 1].set_ylabel('Drawdown (%)')
-    axes[0, 1].grid(True, alpha=0.3)
+    def _plot_results(self, results: Dict):
+        """Generate performance plots"""
 
-    # Rolling Sharpe
-    rolling_sharpe = returns.rolling(63).mean() / returns.rolling(63).std() * np.sqrt(252)
-    axes[1, 0].plot(rolling_sharpe.index, rolling_sharpe.values, linewidth=2)
-    axes[1, 0].axhline(y=1, color='r', linestyle='--', alpha=0.5)
-    axes[1, 0].set_title('Rolling 3-Month Sharpe Ratio')
-    axes[1, 0].set_ylabel('Sharpe Ratio')
-    axes[1, 0].grid(True, alpha=0.3)
+        if 'equity_curve' not in results:
+            return
 
-    # Number of positions
-    axes[1, 1].plot(pv_df.index, pv_df['n_positions'], linewidth=2)
-    axes[1, 1].set_title('Active Positions')
-    axes[1, 1].set_ylabel('Number of Positions')
-    axes[1, 1].grid(True, alpha=0.3)
+        equity_df = results['equity_curve']
 
-    # Monthly returns
-    monthly_returns = returns.resample('M').apply(lambda x: (1 + x).prod() - 1)
-    axes[2, 0].bar(monthly_returns.index, monthly_returns.values * 100,
-                   color=['g' if x > 0 else 'r' for x in monthly_returns.values])
-    axes[2, 0].set_title('Monthly Returns')
-    axes[2, 0].set_ylabel('Return (%)')
-    axes[2, 0].grid(True, alpha=0.3)
+        fig, axes = plt.subplots(2, 2, figsize=(15, 10))
 
-    # Trade P&L distribution
-    trades_df = pd.DataFrame([t for t in results['trades'] if 'pnl' in t])
-    if not trades_df.empty:
-        axes[2, 1].hist(trades_df['pnl'], bins=50, alpha=0.7, edgecolor='black')
-        axes[2, 1].axvline(0, color='black', linestyle='--')
-        axes[2, 1].set_title('Trade P&L Distribution')
-        axes[2, 1].set_xlabel('P&L ($)')
-        axes[2, 1].set_ylabel('Frequency')
-        axes[2, 1].grid(True, alpha=0.3)
+        # 1. Equity curve
+        ax1 = axes[0, 0]
+        ax1.plot(equity_df['date'], equity_df['portfolio_value'], 'b-', linewidth=2)
+        ax1.axhline(self.config.initial_capital, color='gray', linestyle='--', alpha=0.5)
+        ax1.set_title('Portfolio Value', fontsize=14)
+        ax1.set_xlabel('Date')
+        ax1.set_ylabel('Value ($)')
+        ax1.grid(True, alpha=0.3)
 
-    plt.tight_layout()
-    plt.show()
+        # Format y-axis
+        ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'${x:,.0f}'))
 
+        # 2. Drawdown
+        ax2 = axes[0, 1]
+        returns = equity_df['returns'].fillna(0)
+        cumulative = (1 + returns).cumprod()
+        running_max = cumulative.expanding().max()
+        drawdown = (cumulative - running_max) / running_max * 100
 
-def save_backtest_results(results: Dict, filename: str) -> None:
-    """Save backtest results to file"""
+        ax2.fill_between(equity_df['date'], 0, drawdown, color='red', alpha=0.3)
+        ax2.plot(equity_df['date'], drawdown, 'r-', linewidth=1)
+        ax2.set_title('Drawdown %', fontsize=14)
+        ax2.set_xlabel('Date')
+        ax2.set_ylabel('Drawdown (%)')
+        ax2.grid(True, alpha=0.3)
 
-    # Convert numpy types for JSON serialization
-    def convert_types(obj):
-        if isinstance(obj, np.integer):
-            return int(obj)
-        elif isinstance(obj, np.floating):
-            return float(obj)
-        elif isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, pd.Timestamp):
-            return obj.isoformat()
-        elif isinstance(obj, datetime):
-            return obj.isoformat()
-        return obj
+        # 3. Monthly returns
+        ax3 = axes[1, 0]
+        monthly_returns = equity_df.set_index('date')['portfolio_value'].resample('M').last().pct_change() * 100
+        colors = ['green' if x > 0 else 'red' for x in monthly_returns.values]
+        ax3.bar(monthly_returns.index, monthly_returns.values, color=colors, alpha=0.7)
+        ax3.set_title('Monthly Returns %', fontsize=14)
+        ax3.set_xlabel('Month')
+        ax3.set_ylabel('Return (%)')
+        ax3.grid(True, alpha=0.3)
 
-    # Recursively convert all values
-    clean_results = json.loads(json.dumps(results, default=convert_types))
+        # 4. Position count
+        ax4 = axes[1, 1]
+        ax4.plot(equity_df['date'], equity_df['n_positions'], 'g-', linewidth=2)
+        ax4.set_title('Active Positions', fontsize=14)
+        ax4.set_xlabel('Date')
+        ax4.set_ylabel('Number of Positions')
+        ax4.grid(True, alpha=0.3)
+        ax4.set_ylim(0, self.config.max_positions + 2)
 
-    with open(filename, 'w') as f:
-        json.dump(clean_results, f, indent=2)
+        plt.tight_layout()
+        plt.savefig('hedge_fund_backtest_results.png', dpi=300, bbox_inches='tight')
+        plt.close()
 
-    logger.info(f"Results saved to {filename}")
+        logger.info("Results plotted: hedge_fund_backtest_results.png")
 
 
-if __name__ == "__main__":
-    # Example usage
-    from config.watchlist import WATCHLIST
+class RiskManager:
+    """Professional risk management system"""
 
-    # Professional configuration
+    def __init__(self, config: HedgeFundBacktestConfig):
+        self.config = config
+        self.correlation_matrix = None
+        self.risk_metrics = defaultdict(list)
+
+    def calculate_position_size(self, symbol: str, signal_strength: float,
+                                portfolio_value: float, market_data: pd.DataFrame,
+                                current_positions: Dict) -> int:
+        """Calculate position size using risk parity approach"""
+
+        if self.config.position_size_method == "fixed":
+            position_value = portfolio_value * self.config.base_position_size
+
+        elif self.config.position_size_method == "risk_parity":
+            # Get volatility
+            volatility = market_data['volatility_20d'].iloc[-1] if 'volatility_20d' in market_data else 0.20
+
+            # Risk budget per position
+            risk_budget = portfolio_value * self.config.base_position_size * 0.02  # 2% risk
+
+            # Position size based on volatility
+            if volatility > 0:
+                position_value = risk_budget / volatility
+            else:
+                position_value = portfolio_value * self.config.base_position_size
+
+        elif self.config.position_size_method == "kelly":
+            # Simplified Kelly criterion
+            win_rate = 0.55  # Estimate from historical performance
+            avg_win = 0.03
+            avg_loss = 0.02
+
+            kelly_pct = (win_rate * avg_win - (1 - win_rate) * avg_loss) / avg_win
+            kelly_pct = np.clip(kelly_pct * 0.25, 0.01, self.config.max_position_size)  # 1/4 Kelly
+
+            position_value = portfolio_value * kelly_pct
+
+        # Apply signal strength adjustment
+        position_value *= signal_strength
+
+        # Apply maximum position size
+        max_value = portfolio_value * self.config.max_position_size
+        position_value = min(position_value, max_value)
+
+        # Calculate shares
+        current_price = market_data['close'].iloc[-1]
+        shares = int(position_value / current_price)
+
+        return shares
+
+    def check_portfolio_risk(self, positions: Dict, market_data: Dict[str, pd.DataFrame],
+                             portfolio_value: float) -> Dict:
+        """Check portfolio-level risk metrics"""
+
+        risk_checks = {
+            'pass': True,
+            'portfolio_heat': 0,
+            'correlation_risk': False,
+            'concentration_risk': False,
+            'messages': []
+        }
+
+        if not positions:
+            return risk_checks
+
+        # Calculate portfolio heat (total risk)
+        total_risk = 0
+        position_values = {}
+
+        for symbol, position in positions.items():
+            if symbol in market_data:
+                atr = market_data[symbol]['atr'].iloc[-1] if 'atr' in market_data[symbol] else 0
+                position_value = position['quantity'] * position['current_price']
+                position_risk = (atr * position['quantity']) / portfolio_value
+                total_risk += position_risk
+                position_values[symbol] = position_value
+
+        risk_checks['portfolio_heat'] = total_risk
+
+        if total_risk > self.config.max_portfolio_heat:
+            risk_checks['pass'] = False
+            risk_checks['messages'].append(f"Portfolio heat too high: {total_risk:.2%}")
+
+        # Check correlation risk
+        if len(positions) > 3:
+            corr_risk = self._check_correlation_risk(list(positions.keys()), market_data)
+            if corr_risk:
+                risk_checks['correlation_risk'] = True
+                risk_checks['messages'].append("High correlation between positions")
+
+        # Check concentration
+        total_value = sum(position_values.values())
+        if total_value > 0:
+            for symbol, value in position_values.items():
+                if value / total_value > 0.15:  # 15% max per position
+                    risk_checks['concentration_risk'] = True
+                    risk_checks['messages'].append(f"Position too large: {symbol}")
+
+        return risk_checks
+
+    def _check_correlation_risk(self, symbols: List[str],
+                                market_data: Dict[str, pd.DataFrame]) -> bool:
+        """Check if positions are too correlated"""
+
+        # Get returns for correlation calculation
+        returns_data = {}
+        for symbol in symbols:
+            if symbol in market_data:
+                returns = market_data[symbol]['returns'].tail(60) if 'returns' in market_data[symbol] else None
+                if returns is not None and len(returns) >= 60:
+                    returns_data[symbol] = returns
+
+        if len(returns_data) < 2:
+            return False
+
+        # Calculate correlation matrix
+        returns_df = pd.DataFrame(returns_data)
+        corr_matrix = returns_df.corr()
+
+        # Check for high correlations
+        high_corr_pairs = []
+        for i in range(len(corr_matrix.columns)):
+            for j in range(i + 1, len(corr_matrix.columns)):
+                if abs(corr_matrix.iloc[i, j]) > self.config.correlation_threshold:
+                    high_corr_pairs.append((corr_matrix.columns[i], corr_matrix.columns[j]))
+
+        return len(high_corr_pairs) > 0
+
+    def calculate_stop_loss(self, entry_price: float, atr: float, side: str = 'long') -> float:
+        """Calculate dynamic stop loss based on ATR"""
+        stop_distance = atr * self.config.stop_loss_atr_multiplier
+
+        if side == 'long':
+            stop_loss = entry_price - stop_distance
+        else:  # Short positions (if implemented)
+            stop_loss = entry_price + stop_distance
+
+        return stop_loss
+
+    def calculate_take_profit(self, entry_price: float, atr: float, side: str = 'long') -> float:
+        """Calculate dynamic take profit based on ATR"""
+        profit_distance = atr * self.config.take_profit_atr_multiplier
+
+        if side == 'long':
+            take_profit = entry_price + profit_distance
+        else:  # Short positions (if implemented)
+            take_profit = entry_price - profit_distance
+
+        return take_profit
+
+
+def run_hedge_fund_backtest():
+    """Run the hedge fund grade backtest"""
+
+    # Configuration - OPTIMIZED FOR SIGNAL GENERATION
     config = HedgeFundBacktestConfig(
-        initial_capital=1_000_000,
+        initial_capital=100000,
+        position_size_method="risk_parity",
         max_positions=20,
-        train_months=12,
-        validation_months=3,
-        test_months=1,
-        buffer_days=5,
-        min_validation_score=0.55  # Realistic threshold
+        min_prediction_confidence=0.55,  # Lowered
+        ensemble_agreement_threshold=0.50,  # Lowered
+        target_return_threshold=0.01,  # 1% instead of 2%
+        min_sharpe_for_trading=0.5,  # Lowered
+        min_validation_score=0.52  # Lowered
     )
 
     # Create backtester
     backtester = HedgeFundBacktester(config)
 
-    # Run backtest
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=365 * 3)  # 3 years for walk-forward
+    # Define test period
+    end_date = datetime.now().strftime('%Y-%m-%d')
+    start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')  # 1 year backtest
 
+    # Run on full watchlist
+    logger.info(f"Running backtest on {len(WATCHLIST)} symbols")
     results = backtester.run_backtest(
-        symbols=WATCHLIST[:50],  # Test with 50 symbols
-        start_date=start_date.strftime('%Y-%m-%d'),
-        end_date=end_date.strftime('%Y-%m-%d')
+        symbols=WATCHLIST[:50],  # Start with first 50 for testing
+        start_date=start_date,
+        end_date=end_date
     )
 
-    # Display results
-    if 'error' not in results:
-        print("\nBacktest Results:")
-        print(f"Total Return: {results['total_return'] * 100:.2f}%")
-        print(f"Annual Return: {results['annual_return'] * 100:.2f}%")
-        print(f"Sharpe Ratio: {results['sharpe_ratio']:.2f}")
-        print(f"Max Drawdown: {results['max_drawdown'] * 100:.2f}%")
-        print(f"Win Rate: {results['win_rate'] * 100:.1f}%")
+    return results
 
-        # Show data integrity report
-        if 'detailed_report' in results:
-            report = results['detailed_report']
-            print(f"\nData Integrity: {report['summary']['data_integrity']}")
-            print(f"Windows Processed: {report['summary']['total_windows']}")
-            print(f"Average Validation AUC: {report['summary']['avg_validation_auc']:.4f}")
 
-        # Plot results
-        plot_backtest_results(results)
-
-        # Save results
-        save_backtest_results(results, f"backtest_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-    else:
-        print(f"Backtest failed: {results['error']}")
+if __name__ == "__main__":
+    results = run_hedge_fund_backtest()

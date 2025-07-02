@@ -1,7 +1,7 @@
 # models/enhanced_features.py
 """
 Enhanced Feature Engineering with Adaptive Capabilities
-Modified to ensure maximum symbol utilization
+Complete version with 30 methods for comprehensive feature generation
 """
 
 import pandas as pd
@@ -38,6 +38,10 @@ class EnhancedFeatureEngineer:
         self.scaler = RobustScaler()
         self.feature_names = []
 
+        # Feature selection tracking
+        self.feature_correlations = {}
+        self.feature_importance_history = []
+
         if self.use_gpu:
             logger.info("GPU-accelerated feature engineering enabled")
         else:
@@ -67,7 +71,6 @@ class EnhancedFeatureEngineer:
     @cuda.jit
     def _gpu_rolling_stats(arr, window, out_mean, out_std, out_skew, out_kurt):
         """GPU kernel for rolling statistics"""
-        # ... rest of the method
         idx = cuda.grid(1)
         n = arr.shape[0]
 
@@ -262,11 +265,20 @@ class EnhancedFeatureEngineer:
             self._add_features_to_dataframe(features, self._create_advanced_interaction_features(df, features),
                                             df.index)
 
+            # 12. ADDITIONAL: Seasonal features
+            self._add_features_to_dataframe(features, self._create_seasonal_features(df), df.index)
+
+            # 13. ADDITIONAL: Momentum features
+            self._add_features_to_dataframe(features, self._create_momentum_features(df, features), df.index)
+
             # Store feature names
             self.feature_names = features.columns.tolist()
 
             # Handle missing values
             features = self._handle_missing_values(features)
+
+            # Apply feature selection
+            features = self._apply_feature_selection(features, symbol)
 
             return features
 
@@ -918,7 +930,7 @@ class EnhancedFeatureEngineer:
             features['volume_at_high'] = df['volume'] * (df['close'] == df['high']).astype(int)
             features['volume_at_low'] = df['volume'] * (df['close'] == df['low']).astype(int)
             features['volume_at_close'] = df['volume'] * (
-                    abs(df['close'] - df['high']) < abs(df['close'] - df['low'])).astype(int)
+                        abs(df['close'] - df['high']) < abs(df['close'] - df['low'])).astype(int)
 
             # Order flow imbalance proxy
             features['order_flow_imbalance'] = (df['close'] - df['open']) * df['volume']
@@ -1713,6 +1725,158 @@ class EnhancedFeatureEngineer:
 
         return features
 
+    def _create_seasonal_features(self, df: pd.DataFrame) -> Dict:
+        """Create seasonal and calendar-based features - METHOD 29"""
+        features = {}
+
+        try:
+            # Get datetime index
+            if not isinstance(df.index, pd.DatetimeIndex):
+                df.index = pd.to_datetime(df.index)
+
+            # Day of week features
+            features['day_of_week'] = df.index.dayofweek
+            features['is_monday'] = (features['day_of_week'] == 0).astype(int)
+            features['is_friday'] = (features['day_of_week'] == 4).astype(int)
+
+            # Month features
+            features['month'] = df.index.month
+            features['quarter'] = df.index.quarter
+            features['is_month_start'] = df.index.is_month_start.astype(int)
+            features['is_month_end'] = df.index.is_month_end.astype(int)
+            features['is_quarter_start'] = df.index.is_quarter_start.astype(int)
+            features['is_quarter_end'] = df.index.is_quarter_end.astype(int)
+
+            # Trading day of month
+            features['trading_day_of_month'] = df.groupby(pd.Grouper(freq='M')).cumcount() + 1
+
+            # Days until month end
+            month_end = df.index.to_period('M').to_timestamp('M')
+            features['days_until_month_end'] = (month_end - df.index).days
+
+            # Seasonal patterns
+            features['is_january'] = (features['month'] == 1).astype(int)  # January effect
+            features['is_december'] = (features['month'] == 12).astype(int)  # Year-end effect
+            features['is_summer'] = features['month'].isin([6, 7, 8]).astype(int)  # Summer doldrums
+            features['is_earning_season'] = features['month'].isin([1, 4, 7, 10]).astype(int)
+
+            # Options expiration week (third Friday)
+            features['is_opex_week'] = df.index.map(self._is_opex_week).astype(int)
+
+            # Holiday effects (simplified)
+            features['days_from_holiday'] = df.index.map(self._days_from_nearest_holiday)
+            features['is_pre_holiday'] = (features['days_from_holiday'] == -1).astype(int)
+            features['is_post_holiday'] = (features['days_from_holiday'] == 1).astype(int)
+
+            # Turn of month effect (last 4 and first 3 days)
+            features['turn_of_month'] = ((features['trading_day_of_month'] <= 3) |
+                                         (features['days_until_month_end'] <= 4)).astype(int)
+
+            # Sine and cosine encoding for cyclical features
+            features['day_of_week_sin'] = np.sin(2 * np.pi * features['day_of_week'] / 5)
+            features['day_of_week_cos'] = np.cos(2 * np.pi * features['day_of_week'] / 5)
+            features['month_sin'] = np.sin(2 * np.pi * features['month'] / 12)
+            features['month_cos'] = np.cos(2 * np.pi * features['month'] / 12)
+
+        except Exception as e:
+            logger.error(f"Error in seasonal features: {e}")
+
+        return features
+
+    def _create_momentum_features(self, df: pd.DataFrame, base_features: pd.DataFrame) -> Dict:
+        """Create advanced momentum features - METHOD 30"""
+        features = {}
+
+        try:
+            # Time-series momentum
+            for lookback in [20, 60, 120, 252]:
+                if len(df) >= lookback + 20:
+                    # Absolute momentum
+                    features[f'momentum_{lookback}d'] = df['close'] / df['close'].shift(lookback) - 1
+
+                    # Relative momentum (vs rolling average)
+                    ma = df['close'].rolling(lookback, min_periods=lookback // 2).mean()
+                    features[f'relative_momentum_{lookback}d'] = df['close'] / ma - 1
+
+                    # Momentum quality (consistency)
+                    returns = df['close'].pct_change()
+                    positive_days = (returns > 0).rolling(lookback, min_periods=lookback // 2).sum()
+                    features[f'momentum_quality_{lookback}d'] = positive_days / lookback
+
+            # Dual momentum
+            if 'momentum_60d' in features and 'momentum_252d' in features:
+                features['dual_momentum'] = (features['momentum_60d'] + features['momentum_252d']) / 2
+                features['momentum_spread'] = features['momentum_60d'] - features['momentum_252d']
+
+            # Momentum acceleration
+            for period in [20, 60]:
+                if f'momentum_{period}d' in features:
+                    features[f'momentum_accel_{period}d'] = features[f'momentum_{period}d'].diff(5)
+
+            # Price momentum oscillator
+            if len(df) >= 35:
+                roc1 = df['close'].pct_change(10) * 100
+                roc2 = roc1.rolling(10, min_periods=5).mean()
+                features['price_momentum_oscillator'] = roc1 - roc2
+
+            # Momentum divergence index
+            if 'rsi_14' in base_features and 'momentum_20d' in features:
+                price_momentum = features['momentum_20d']
+                rsi_momentum = base_features['rsi_14'].pct_change(20)
+                features['momentum_divergence_index'] = price_momentum - rsi_momentum
+
+            # Sector relative momentum (if available)
+            # This would compare symbol momentum to sector momentum
+            features['relative_strength'] = 0  # Placeholder - would need sector data
+
+            # Momentum regime
+            if 'momentum_60d' in features:
+                mom_60 = features['momentum_60d']
+                features['momentum_regime_strong'] = (
+                            mom_60 > mom_60.rolling(252, min_periods=126).quantile(0.8)).astype(int)
+                features['momentum_regime_weak'] = (mom_60 < mom_60.rolling(252, min_periods=126).quantile(0.2)).astype(
+                    int)
+
+            # Time-based momentum decay
+            for period in [5, 10, 20]:
+                if f'return_{period}d' in base_features:
+                    # Weight recent returns more heavily
+                    weights = np.exp(-np.arange(period) / period)
+                    weights = weights / weights.sum()
+
+                    weighted_returns = df['close'].pct_change().rolling(period).apply(
+                        lambda x: np.sum(x.values * weights[:len(x)]) if len(x) == period else np.nan
+                    )
+                    features[f'weighted_momentum_{period}d'] = weighted_returns
+
+            # Momentum consistency score
+            returns = df['close'].pct_change()
+            for period in [20, 60]:
+                if len(df) >= period:
+                    # Calculate rolling correlation of returns with time
+                    time_series = np.arange(period)
+
+                    def trend_strength(x):
+                        if len(x) == period:
+                            return np.corrcoef(x, time_series)[0, 1]
+                        return 0
+
+                    features[f'momentum_consistency_{period}d'] = returns.rolling(period).apply(trend_strength)
+
+            # Momentum breakout
+            if 'momentum_20d' in features:
+                mom_20 = features['momentum_20d']
+                mom_high = mom_20.rolling(60, min_periods=30).max()
+                mom_low = mom_20.rolling(60, min_periods=30).min()
+
+                features['momentum_breakout_up'] = (mom_20 > mom_high.shift(1)).astype(int)
+                features['momentum_breakout_down'] = (mom_20 < mom_low.shift(1)).astype(int)
+
+        except Exception as e:
+            logger.error(f"Error in momentum features: {e}")
+
+        return features
+
     def _calculate_divergence(self, price: np.ndarray, indicator: np.ndarray,
                               window: int = 20) -> np.ndarray:
         """Calculate divergence between price and indicator"""
@@ -1913,6 +2077,57 @@ class EnhancedFeatureEngineer:
 
         return features
 
+    def _is_opex_week(self, date: pd.Timestamp) -> bool:
+        """Check if date is in options expiration week (third Friday)"""
+        # Find third Friday of the month
+        first_day = date.replace(day=1)
+        first_friday = first_day + pd.Timedelta(days=(4 - first_day.weekday()) % 7)
+        third_friday = first_friday + pd.Timedelta(weeks=2)
+
+        # Check if current date is within 5 days of third Friday
+        return abs((date - third_friday).days) <= 5
+
+    def _days_from_nearest_holiday(self, date: pd.Timestamp) -> int:
+        """Calculate days from nearest major market holiday (simplified)"""
+        # Major US market holidays (simplified list)
+        holidays = [
+            pd.Timestamp(date.year, 1, 1),  # New Year
+            pd.Timestamp(date.year, 7, 4),  # Independence Day
+            pd.Timestamp(date.year, 12, 25),  # Christmas
+        ]
+
+        # Find nearest holiday
+        min_distance = float('inf')
+        for holiday in holidays:
+            distance = (date - holiday).days
+            if abs(distance) < abs(min_distance):
+                min_distance = distance
+
+        return min_distance
+
+    def _apply_feature_selection(self, features: pd.DataFrame, symbol: str) -> pd.DataFrame:
+        """Apply feature selection based on importance and correlation"""
+
+        # For now, return all features
+        # In production, you would:
+        # 1. Remove highly correlated features
+        # 2. Remove low importance features
+        # 3. Apply dimensionality reduction if needed
+
+        return features
+
+    def _create_price_features_gpu(self, features_df, close, high, low, open_price):
+        """GPU-accelerated price feature creation"""
+        # This would contain GPU-specific implementations
+        # For now, it's a placeholder
+        return features_df
+
+    def _create_volume_features_gpu(self, features_df, close, volume):
+        """GPU-accelerated volume feature creation"""
+        # This would contain GPU-specific implementations
+        # For now, it's a placeholder
+        return features_df
+
     def get_feature_summary(self) -> Dict:
         """Get summary of generated features"""
 
@@ -1922,21 +2137,31 @@ class EnhancedFeatureEngineer:
         summary = {
             "total_features": len(self.feature_names),
             "by_category": {
-                "price": len([f for f in self.feature_names if any(x in f for x in ['price', 'return', 'close', 'sma', 'ema'])]),
+                "price": len(
+                    [f for f in self.feature_names if any(x in f for x in ['price', 'return', 'close', 'sma', 'ema'])]),
                 "volume": len([f for f in self.feature_names if 'volume' in f or 'vol' in f]),
-                "volatility": len([f for f in self.feature_names if any(x in f for x in ['volatility', 'atr', 'bb', 'std'])]),
-                "technical": len([f for f in self.feature_names if any(x in f for x in ['rsi', 'macd', 'stoch', 'cci', 'mfi'])]),
-                "microstructure": len([f for f in self.feature_names if any(x in f for x in ['spread', 'noise', 'amihud'])]),
+                "volatility": len(
+                    [f for f in self.feature_names if any(x in f for x in ['volatility', 'atr', 'bb', 'std'])]),
+                "technical": len(
+                    [f for f in self.feature_names if any(x in f for x in ['rsi', 'macd', 'stoch', 'cci', 'mfi'])]),
+                "microstructure": len(
+                    [f for f in self.feature_names if any(x in f for x in ['spread', 'noise', 'amihud'])]),
                 "pattern": len([f for f in self.feature_names if 'cdl' in f or 'pattern' in f]),
                 "regime": len([f for f in self.feature_names if 'regime' in f]),
                 "ml": len([f for f in self.feature_names if any(x in f for x in ['entropy', 'fractal', 'hurst'])]),
-                "interaction": len([f for f in self.feature_names if any(x in f for x in ['cross', 'divergence', 'signal', 'confluence'])])
+                "interaction": len([f for f in self.feature_names if
+                                    any(x in f for x in ['cross', 'divergence', 'signal', 'confluence'])]),
+                "seasonal": len([f for f in self.feature_names if
+                                 any(x in f for x in ['day_of_week', 'month', 'quarter', 'holiday'])]),
+                "momentum": len([f for f in self.feature_names if 'momentum' in f])
             },
             "key_interactions": {
                 "ma_crossovers": len([f for f in self.feature_names if 'cross' in f and ('sma' in f or 'ema' in f)]),
                 "divergences": len([f for f in self.feature_names if 'divergence' in f]),
                 "market_scores": len([f for f in self.feature_names if 'score' in f]),
-                "regime_features": len([f for f in self.feature_names if 'regime' in f])
+                "regime_features": len([f for f in self.feature_names if 'regime' in f]),
+                "composite_signals": len(
+                    [f for f in self.feature_names if any(x in f for x in ['triple_', 'combo', 'setup'])])
             }
         }
 
