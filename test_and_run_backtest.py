@@ -224,13 +224,25 @@ def run_minimal_backtest_simple():
         X_val = X_train.iloc[split_idx:]
         y_val = y_train.iloc[split_idx:]
 
+        # Fix: Split the sample weights to match the train/val split
+        sample_weights_split = None
+        if info.get('sample_weights') is not None:
+            # Split weights the same way as X_train
+            sample_weights_split = info['sample_weights'][:split_idx]
+
+            # Verify the sizes match
+            assert len(sample_weights_split) == len(X_train_split), \
+                f"Weight size mismatch: {len(sample_weights_split)} vs {len(X_train_split)}"
+
+            print(f"  Sample weights: {len(info['sample_weights'])} total -> {len(sample_weights_split)} for training")
+
         print(f"  Train split: {len(X_train_split)} samples")
         print(f"  Val split: {len(X_val)} samples")
 
-        # Train models
+        # Train models with properly split weights
         print("\nTraining models (this may take a few minutes)...")
         ensemble.train_combined(X_train_split, y_train_split, X_val, y_val,
-                                sample_weights=info.get('sample_weights'))
+                                sample_weights=sample_weights_split)  # Pass the split weights
 
         # Validate
         val_score = ensemble.validate(X_val, y_val)
