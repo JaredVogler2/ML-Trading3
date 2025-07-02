@@ -42,6 +42,13 @@ except ImportError:
 # Import enhanced features
 from models.enhanced_features import EnhancedFeatureEngineer
 
+from sklearn.feature_selection import (
+    SelectKBest, f_classif, mutual_info_classif,
+    RFE, SelectFromModel, VarianceThreshold
+)
+from sklearn.ensemble import RandomForestClassifier
+import pandas as pd
+
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -265,6 +272,115 @@ class HedgeFundGPUEnsemble:
             logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
         else:
             logger.warning("GPU not available, using CPU")
+
+    def select_features(self, X_train: pd.DataFrame, y_train: pd.Series,
+                        X_val: pd.DataFrame = None, max_features: int = 100) -> Tuple[
+        pd.DataFrame, pd.DataFrame, List[str]]:
+        """
+        Perform multi-stage feature selection to reduce overfitting
+
+        Args:
+            X_train: Training features
+            y_train: Training targets
+            X_val: Validation features (optional)
+            max_features: Maximum number of features to keep
+
+        Returns:
+            Selected training features, validation features, and selected feature names
+        """
+        logger.info(f"Starting feature selection from {X_train.shape[1]} features...")
+
+        # Store original feature names
+        original_features = X_train.columns.tolist()
+        selected_mask = np.ones(len(original_features), dtype=bool)
+
+        # Stage 1: Remove low variance features
+        logger.info("Stage 1: Removing low variance features...")
+        variance_selector = VarianceThreshold(threshold=0.01)
+        variance_selector.fit(X_train)
+        selected_mask &= variance_selector.get_support()
+        logger.info(f"  Removed {(~selected_mask).sum()} low variance features")
+
+        # Apply variance filter
+        X_train_filtered = X_train.loc[:, selected_mask]
+
+        # Stage 2: Remove highly correlated features (correlation > 0.95)
+        logger.info("Stage 2: Removing highly correlated features...")
+        corr_matrix = X_train_filtered.corr().abs()
+        upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+        to_drop = [column for column in upper_tri.columns if any(upper_tri[column] > 0.95)]
+        X_train_filtered = X_train_filtered.drop(columns=to_drop)
+        logger.info(f"  Removed {len(to_drop)} highly correlated features")
+
+        # Update selected features
+        remaining_features = X_train_filtered.columns.tolist()
+
+        # Stage 3: Univariate feature selection (F-score)
+        logger.info("Stage 3: Univariate feature selection...")
+        k_best = min(max_features * 2, len(remaining_features))  # Keep 2x target for next stage
+        univariate_selector = SelectKBest(f_classif, k=k_best)
+        univariate_selector.fit(X_train_filtered, y_train)
+        univariate_scores = pd.Series(
+            univariate_selector.scores_,
+            index=remaining_features
+        ).sort_values(ascending=False)
+
+        # Stage 4: Tree-based feature importance
+        logger.info("Stage 4: Tree-based feature importance...")
+        rf = RandomForestClassifier(
+            n_estimators=100,
+            max_depth=5,
+            random_state=42,
+            n_jobs=-1
+        )
+        rf.fit(X_train_filtered, y_train)
+        tree_importance = pd.Series(
+            rf.feature_importances_,
+            index=remaining_features
+        ).sort_values(ascending=False)
+
+        # Stage 5: Combine rankings and select top features
+        logger.info("Stage 5: Combining feature rankings...")
+
+        # Normalize scores to [0, 1]
+        univariate_ranks = univariate_scores.rank(pct=True)
+        tree_ranks = tree_importance.rank(pct=True)
+
+        # Combined score (average rank)
+        combined_ranks = (univariate_ranks + tree_ranks) / 2
+        combined_ranks = combined_ranks.sort_values(ascending=False)
+
+        # Select top features
+        n_features_to_select = min(max_features, len(combined_ranks))
+        selected_features = combined_ranks.head(n_features_to_select).index.tolist()
+
+        # Stage 6: Add back critical features if missing
+        critical_features = [
+            'returns_1d', 'returns_5d', 'volume_ratio',
+            'rsi', 'price_vs_sma20', 'volatility_20d'
+        ]
+        for feature in critical_features:
+            if feature in original_features and feature not in selected_features:
+                if len(selected_features) < max_features:
+                    selected_features.append(feature)
+
+        logger.info(f"Selected {len(selected_features)} features from {X_train.shape[1]}")
+
+        # Log top features
+        logger.info("Top 20 selected features:")
+        for i, feature in enumerate(selected_features[:20]):
+            score = combined_ranks.get(feature, 0)
+            logger.info(f"  {i + 1}. {feature}: {score:.4f}")
+
+        # Apply selection
+        X_train_selected = X_train[selected_features]
+        X_val_selected = X_val[selected_features] if X_val is not None else None
+
+        # Store selected features
+        self.selected_features = selected_features
+        self.feature_scores = combined_ranks
+
+        return X_train_selected, X_val_selected, selected_features
 
     def _create_minimal_features(self, df: pd.DataFrame, symbol: str) -> pd.DataFrame:
         """Create minimal feature set when full features fail"""
@@ -501,37 +617,37 @@ class HedgeFundGPUEnsemble:
     def train_combined(self, X_train: pd.DataFrame, y_train: pd.Series,
                        X_val: pd.DataFrame, y_val: pd.Series,
                        sample_weights: np.ndarray = None) -> None:
-        """Train all models with GPU acceleration"""
+        """Train all models with GPU acceleration and feature selection"""
 
         logger.info(f"Training ensemble on {len(X_train)} samples with {X_train.shape[1]} features")
 
-        # IMPORTANT: Align features BEFORE scaling
-        X_train, X_val = self._align_features(X_train, X_val)
+        # FEATURE SELECTION
+        if X_train.shape[1] > 150:  # Only do selection if we have many features
+            # Determine optimal number of features based on sample size
+            samples_per_feature = len(X_train) / X_train.shape[1]
+            if samples_per_feature < 50:
+                # We need at least 50 samples per feature to avoid overfitting
+                max_features = max(50, int(len(X_train) / 50))
+            else:
+                max_features = 150
+
+            logger.info(f"Performing feature selection (target: {max_features} features)...")
+            X_train, X_val, self.feature_names = self.select_features(
+                X_train, y_train, X_val, max_features=max_features
+            )
+            logger.info(f"Reduced to {X_train.shape[1]} features")
+        else:
+            self.selected_features = X_train.columns.tolist()
+            self.feature_names = X_train.columns.tolist()
 
         # Scale features
         if 'robust' not in self.scalers:
             self.scalers['robust'] = RobustScaler()
-            # Fit only on finite values
-            finite_mask = np.isfinite(X_train).all(axis=1)
-            if finite_mask.sum() > 0:
-                X_train_finite = X_train[finite_mask]
-                self.scalers['robust'].fit(X_train_finite)
-            else:
-                logger.error("No finite values in training data!")
-                self.scalers['robust'].fit(X_train)  # Fallback
-            X_train_scaled = self.scalers['robust'].transform(X_train)
+            X_train_scaled = self.scalers['robust'].fit_transform(X_train)
         else:
             X_train_scaled = self.scalers['robust'].transform(X_train)
 
         X_val_scaled = self.scalers['robust'].transform(X_val)
-
-        # Replace any NaN/inf values that might have been introduced by scaling
-        X_train_scaled = np.nan_to_num(X_train_scaled, nan=0.0, posinf=5.0, neginf=-5.0).astype(np.float32)
-        X_val_scaled = np.nan_to_num(X_val_scaled, nan=0.0, posinf=5.0, neginf=-5.0).astype(np.float32)
-
-        # Clip extreme values
-        X_train_scaled = np.clip(X_train_scaled, -10, 10)
-        X_val_scaled = np.clip(X_val_scaled, -10, 10)
 
         # Convert to numpy arrays
         X_train_scaled = np.nan_to_num(X_train_scaled, 0).astype(np.float32)
@@ -913,18 +1029,75 @@ class HedgeFundGPUEnsemble:
                 pred = model.predict_proba(X_val)[:, 1]
             elif name in ['attention_lstm', 'cnn_lstm', 'transformer']:
                 pred = self._predict_deep_model(model, X_val)
+                # FIX: Handle sequence length mismatch for deep models
+                # Deep models return fewer predictions due to sequence preparation
+                if len(pred) < len(y_val):
+                    # Align y_val with predictions by removing first samples
+                    y_val_aligned = y_val[self.config.sequence_length:]
+                else:
+                    y_val_aligned = y_val
             else:
                 continue
 
-            val_predictions[name] = pred
-            val_scores[name] = roc_auc_score(y_val, pred)
-            logger.info(f"{name} validation AUC: {val_scores[name]:.4f}")
+            # Use appropriate y_val for scoring
+            if name in ['attention_lstm', 'cnn_lstm', 'transformer'] and 'y_val_aligned' in locals():
+                val_predictions[name] = pred
+                val_scores[name] = roc_auc_score(y_val_aligned, pred)
+                logger.info(f"{name} validation AUC: {val_scores[name]:.4f} (aligned samples: {len(pred)})")
+            else:
+                val_predictions[name] = pred
+                val_scores[name] = roc_auc_score(y_val, pred)
+                logger.info(f"{name} validation AUC: {val_scores[name]:.4f}")
 
-        # Calculate weights based on performance (could use more sophisticated optimization)
-        total_score = sum(val_scores.values())
-        self.model_weights = {name: score / total_score for name, score in val_scores.items()}
+        # Filter out poorly performing models (below 0.52 AUC is basically random)
+        min_auc_threshold = 0.52
+        filtered_scores = {name: score for name, score in val_scores.items()
+                           if score >= min_auc_threshold}
 
+        if not filtered_scores:
+            # If no models meet threshold, use top 3
+            sorted_models = sorted(val_scores.items(), key=lambda x: x[1], reverse=True)
+            filtered_scores = dict(sorted_models[:3])
+            logger.info(f"No models above {min_auc_threshold} AUC, using top 3 models")
+        else:
+            logger.info(f"Using {len(filtered_scores)} models above {min_auc_threshold} AUC threshold")
+
+        # Calculate weights using softmax on scores for better discrimination
+        # This amplifies differences between model performances
+        scores_array = np.array(list(filtered_scores.values()))
+        # Scale and shift scores to amplify differences
+        scaled_scores = (scores_array - 0.5) * 10  # Amplify differences from 0.5
+        exp_scores = np.exp(scaled_scores)
+        softmax_weights = exp_scores / np.sum(exp_scores)
+
+        # Initialize all weights to 0
+        self.model_weights = {name: 0.0 for name in self.models.keys()}
+
+        # Assign calculated weights
+        for (name, score), weight in zip(filtered_scores.items(), softmax_weights):
+            self.model_weights[name] = float(weight)
+
+        # Log results
+        logger.info(f"Excluded models: {[name for name in val_scores if name not in filtered_scores]}")
         logger.info(f"Optimized ensemble weights: {self.model_weights}")
+
+        # Verify ensemble performance with these weights
+        ensemble_pred = np.zeros(len(y_val))
+        for name, weight in self.model_weights.items():
+            if weight > 0:
+                if name in val_predictions:
+                    pred = val_predictions[name]
+                    # Handle length mismatch
+                    if len(pred) < len(y_val):
+                        # Pad beginning with 0.5
+                        padded_pred = np.full(len(y_val), 0.5)
+                        padded_pred[len(y_val) - len(pred):] = pred
+                        pred = padded_pred
+                    ensemble_pred += pred * weight
+
+        if np.sum(list(self.model_weights.values())) > 0:
+            ensemble_auc = roc_auc_score(y_val, ensemble_pred)
+            logger.info(f"Ensemble validation AUC: {ensemble_auc:.4f}")
 
     def _predict_deep_model(self, model: nn.Module, X: np.ndarray) -> np.ndarray:
         """Get predictions from deep learning model"""
@@ -934,7 +1107,7 @@ class HedgeFundGPUEnsemble:
         X_seq, _, _ = self._prepare_sequences(X, np.zeros(len(X)))
 
         if len(X_seq) == 0:
-            return np.array([0.5])
+            return np.full(len(X), 0.5)  # Return array of correct length
 
         # Create dataset and loader
         dataset = TensorDataset(torch.FloatTensor(X_seq))
@@ -948,7 +1121,25 @@ class HedgeFundGPUEnsemble:
                 outputs = model(batch_X)
                 predictions.extend(torch.sigmoid(outputs).cpu().numpy())
 
-        return np.array(predictions)
+        predictions = np.array(predictions)
+
+        # FIX: Ensure predictions match input length
+        # For the first sequence_length samples, use the first prediction
+        # This maintains temporal consistency
+        if len(predictions) < len(X):
+            # Pad the beginning with the first prediction value
+            # since we can't make predictions for the first sequence_length samples
+            padding_length = len(X) - len(predictions)
+            if len(predictions) > 0:
+                # Use the first prediction for padding
+                padded_predictions = np.full(len(X), predictions[0])
+                padded_predictions[padding_length:] = predictions
+            else:
+                # If no predictions, use default 0.5
+                padded_predictions = np.full(len(X), 0.5)
+            return padded_predictions
+
+        return predictions
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         """Generate ensemble predictions"""
@@ -966,7 +1157,9 @@ class HedgeFundGPUEnsemble:
         X_scaled = self.scalers['robust'].transform(X.values.astype(np.float32))
         X_scaled = np.nan_to_num(X_scaled, 0)
 
-        predictions = []
+        # Store predictions with their weights
+        weighted_predictions = []
+        total_weight = 0
 
         for name, model in self.models.items():
             weight = self.model_weights.get(name, 0)
@@ -982,18 +1175,38 @@ class HedgeFundGPUEnsemble:
                 pred = model.predict_proba(X_scaled)[:, 1]
             elif name in ['attention_lstm', 'cnn_lstm', 'transformer']:
                 pred = self._predict_deep_model(model, X_scaled)
-                # Ensure prediction length matches
-                if len(pred) < len(X):
-                    pred = np.pad(pred, (0, len(X) - len(pred)), constant_values=0.5)
-                elif len(pred) > len(X):
-                    pred = pred[-len(X):]
+                # The fixed _predict_deep_model should already handle length alignment
             else:
                 continue
 
-            predictions.append(pred * weight)
+            # Ensure prediction is numpy array and has correct shape
+            pred = np.asarray(pred).flatten()
 
-        # Weighted average
-        ensemble_pred = np.sum(predictions, axis=0)
+            # Verify prediction length matches input
+            if len(pred) != len(X):
+                # This shouldn't happen with fixed _predict_deep_model, but just in case
+                if len(pred) < len(X):
+                    # Pad with neutral predictions
+                    padded_pred = np.full(len(X), 0.5)
+                    padded_pred[len(X) - len(pred):] = pred
+                    pred = padded_pred
+                else:
+                    # Truncate
+                    pred = pred[:len(X)]
+
+            # Add weighted prediction
+            weighted_predictions.append(pred * weight)
+            total_weight += weight
+
+        if not weighted_predictions:
+            logger.warning("No predictions generated, returning neutral predictions")
+            return np.full(len(X), 0.5)
+
+        # Combine predictions
+        ensemble_pred = np.sum(weighted_predictions, axis=0)
+
+        # Ensure predictions are in valid range [0, 1]
+        ensemble_pred = np.clip(ensemble_pred, 0, 1)
 
         return ensemble_pred
 
